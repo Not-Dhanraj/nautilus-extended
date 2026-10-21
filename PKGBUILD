@@ -18,8 +18,8 @@ pkgname=(
 )
 packager="Albert Vaca Cintora <albertvaka@gmail.com>"
 pkgver=50.1
-pkgrel=1
-pkgdesc="Default file manager for GNOME - Patched to bring back the 'typeahead find' feature"
+pkgrel=8
+pkgdesc="Default file manager for GNOME - Patched with typeahead navigation and per-folder time/name grouping"
 url="https://apps.gnome.org/Nautilus/"
 arch=(x86_64)
 license=(GPL-3.0-or-later)
@@ -67,25 +67,32 @@ source=(
   "git+https://gitlab.gnome.org/GNOME/nautilus.git#tag=${pkgver/[a-z]/.&}"
   "0001-Restore-backspace-for-going-to-parent-folder.patch"
   "0002-Restore-typeahead-support-for-keyboard-navigation.patch"
+  "0003-Add-per-folder-time-grouping.patch"
   "post.install"
 )
 b2sums=(
   '7a69b11b6053a22858a000a8d0b0a39085b061dce6e5dab792fde58b5bed7f8464f2ef4aaadc1d83056f7ceff948b3c40f433f5fa4fb2d3c5865adf74b666460'
   'b9af0c0c3c9e233d13a1287d5f5fa7b159cff5532ccd589791c4916f34c69cc27755207cbec1c0a87ccce7a273d3e7d3f9c1d756e2a6bedae0124f30a214fef0'
   '36aa7c865278fae3a9444f367cbe8104e3806bd35b580096a12d8af6e95db40c0d3a93ef7e02b4d2dcc46fd9a2dd8b6706d8089e815ead0efc8c3ed7cb8b672a'
+  'c4131502ce0a4f43995b41723da526c2f4a30e7ea4fa938dd5e1e4bff174b3eb348f9479a97f6e3c3368eb53a9dea1bc3d583d4f433fa5187a330ad5c32c69da'
   '7ba197c2e65108ab49c1795c44264181c3c6b8f7d6641d1b1353690202c915e0aed574f45467924f6fb67a65f9487a3c0e24252633066e25b4d2c0dac3609245'
 )
 
 prepare() {
   cd nautilus
 
-  # Apply typeahead patches
+  # Apply navigation and folder-grouping patches
   for p in ../????-*.patch; do
     patch -Np1 -i "$p"
   done
 
   # Enable typeahead behavior by default
   gawk -i inplace '/type-ahead-search/{c++;} c==1 && /true/{sub("true", "false"); c++;} 1' data/org.gnome.nautilus.gschema.xml
+
+  # GLib 2.90 introduced g_set_date_time(), which collides with Nautilus's
+  # internal helper of the same name in the 50.1 source release.
+  find src -type f \( -name '*.c' -o -name '*.h' \) -exec \
+    sed -i 's/\<g_set_date_time\>/nautilus_set_date_time/g' {} +
 }
 
 build() {
