@@ -1,8 +1,8 @@
 pkgbase = nautilus-typeahead
-	pkgdesc = Default file manager for GNOME - Patched with typeahead navigation and per-folder time/name grouping
+	pkgdesc = Nautilus Extended - GNOME file manager with per-folder grouping and type-ahead navigation
 	pkgver = 51.1
 	pkgrel = 1
-	url = https://apps.gnome.org/Nautilus/
+	url = https://github.com/Not-Dhanraj/nautilus-extended
 	arch = x86_64
 	license = GPL-3.0-or-later
 	makedepends = appstream

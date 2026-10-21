@@ -1,6 +1,6 @@
-# Nautilus type-ahead and folder grouping
+# Nautilus Extended
 
-An Arch/CachyOS package for Nautilus 51.1 with type-ahead navigation and per-folder time/name grouping.
+A downstream fork of Nautilus 51.1 for Arch/CachyOS, with per-folder grouping, type-ahead navigation, and other usability improvements.
 > [!WARNING]
 > **AI disclosure**
 >
@@ -64,6 +64,8 @@ makepkg -si
 
 The package replaces the distribution's Nautilus package. Restart Nautilus after installation when it is safe to close its windows.
 
+The project is named **Nautilus Extended**. The Arch packages retain the names `nautilus-typeahead` and `libnautilus-extension-typeahead` for compatibility with existing installations.
+
 To extract the patched source for inspection without building a package:
 
 ```sh
@@ -104,7 +106,7 @@ Maintain source changes as small commits against the Nautilus version named in `
 
 ## Reporting issues
 
-If you have an issue, please open an issue in the tracker of the fork you are using. For the AUR package, the [package discussion](https://aur.archlinux.org/packages/nautilus-typeahead) is also available. Do not report downstream-only problems to upstream Nautilus unless they reproduce without these patches.
+Report issues in the [Nautilus Extended issue tracker](https://github.com/Not-Dhanraj/nautilus-extended/issues). Do not report downstream-only problems to upstream Nautilus unless they reproduce without these patches.
 
 Include:
 
