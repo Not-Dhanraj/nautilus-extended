@@ -18,7 +18,7 @@ pkgname=(
 )
 packager="Albert Vaca Cintora <albertvaka@gmail.com>"
 pkgver=50.1
-pkgrel=8
+pkgrel=11
 pkgdesc="Default file manager for GNOME - Patched with typeahead navigation and per-folder time/name grouping"
 url="https://apps.gnome.org/Nautilus/"
 arch=(x86_64)
@@ -67,23 +67,41 @@ source=(
   "git+https://gitlab.gnome.org/GNOME/nautilus.git#tag=${pkgver/[a-z]/.&}"
   "0001-Restore-backspace-for-going-to-parent-folder.patch"
   "0002-Restore-typeahead-support-for-keyboard-navigation.patch"
-  "0003-Add-per-folder-time-grouping.patch"
+  "0003-Add-per-folder-grouping-policy-and-list-sections.patch"
+  "0004-Add-virtualized-grouped-icon-view.patch"
+  "0005-Cycle-typeahead-matches-in-display-order.patch"
   "post.install"
 )
 b2sums=(
   '7a69b11b6053a22858a000a8d0b0a39085b061dce6e5dab792fde58b5bed7f8464f2ef4aaadc1d83056f7ceff948b3c40f433f5fa4fb2d3c5865adf74b666460'
   'b9af0c0c3c9e233d13a1287d5f5fa7b159cff5532ccd589791c4916f34c69cc27755207cbec1c0a87ccce7a273d3e7d3f9c1d756e2a6bedae0124f30a214fef0'
   '36aa7c865278fae3a9444f367cbe8104e3806bd35b580096a12d8af6e95db40c0d3a93ef7e02b4d2dcc46fd9a2dd8b6706d8089e815ead0efc8c3ed7cb8b672a'
-  'c4131502ce0a4f43995b41723da526c2f4a30e7ea4fa938dd5e1e4bff174b3eb348f9479a97f6e3c3368eb53a9dea1bc3d583d4f433fa5187a330ad5c32c69da'
+  '514c662e66b1bdacc8e92f0967bc7ca0f3888a121cef7cf5f2fed2ff2ef06f6b626cf5b2fec3518f8c5c671eac925257c0ebdf4d065bfe7e6ef0d2e8fc49aa77'
+  '0f939f1c038076ccdafd8e4de86b904225d3b88067300df1523669d6cccb9bf0c2fb8b8d216538f6fc7bee532996a22c0c60c22779052c8c8b6dc815de12f8e7'
+  '0710acd55228a0cf1de22141826236e2948b5cab6808678899ce76b339679ae29b1f37e156d77b227a01c47fd238d2bf5c1f34a076d1eae628cabd2224aafb67'
   '7ba197c2e65108ab49c1795c44264181c3c6b8f7d6641d1b1353690202c915e0aed574f45467924f6fb67a65f9487a3c0e24252633066e25b4d2c0dac3609245'
 )
 
 prepare() {
+  local p
+  local -a added_paths
+
   cd nautilus
 
-  # Apply navigation and folder-grouping patches
-  for p in ../????-*.patch; do
-    patch -Np1 -i "$p"
+  # Apply declared patches only: srcdir may retain obsolete cached patch links.
+  for p in "${source[@]}"; do
+    [[ $p == *.patch ]] || continue
+    # Older builds used patch(1), leaving these generated files untracked.
+    # Clean only paths created by this declared patch, never the whole checkout.
+    mapfile -t added_paths < <(
+      git apply --summary "$srcdir/$p" | gawk '$1 == "create" && $2 == "mode" { print $4 }'
+    )
+    if (( ${#added_paths[@]} )); then
+      git clean -f -- "${added_paths[@]}" || return
+    fi
+    # Stage patch outputs in this disposable source checkout so makepkg's next
+    # forced Git checkout also removes files added by the series.
+    git apply --index "$srcdir/$p" || return
   done
 
   # Enable typeahead behavior by default

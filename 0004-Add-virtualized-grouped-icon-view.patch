@@ -1,0 +1,2357 @@
+From ac483ce65ca1936b3612ef83b04ffcac93fd76b3 Mon Sep 17 00:00:00 2001
+From: Dhanraj <dp914278@gmail.com>
+Date: Wed, 21 Oct 2026 23:27:38 +0530
+Subject: [PATCH 4/5] Add virtualized grouped icon view
+
+Keep native ungrouped grid setup separate from the grouped controller and row model. Enable grouping for icon views and add their regression coverage without changing source selection semantics.
+---
+ NEWS                                     |    6 +-
+ po/POTFILES.in                           |    1 +
+ src/meson.build                          |    4 +
+ src/nautilus-files-view.c                |    2 +-
+ src/nautilus-grid-row-model.c            |  438 ++++++++
+ src/nautilus-grid-row-model.h            |   42 +
+ src/nautilus-grid-view.c                 |  290 ++++-
+ src/nautilus-grouped-grid.c              | 1221 ++++++++++++++++++++++
+ src/nautilus-grouped-grid.h              |   40 +
+ test/automated/display/test-files-view.c |    4 +
+ 10 files changed, 1998 insertions(+), 50 deletions(-)
+ create mode 100644 src/nautilus-grid-row-model.c
+ create mode 100644 src/nautilus-grid-row-model.h
+ create mode 100644 src/nautilus-grouped-grid.c
+ create mode 100644 src/nautilus-grouped-grid.h
+
+diff --git a/NEWS b/NEWS
+index 68af020..07597df 100644
+--- a/NEWS
++++ b/NEWS
+@@ -1,8 +1,8 @@
+ Downstream grouping support
+ ===========================
+-- Add per-folder time/name grouping to list views and list-mode Nautilus choosers.
+-- Keep folders-first within sections and preserve older folder preferences.
+-- Isolate classification and calendar policy from view/header lifecycle code.
++- Add per-folder time/name grouping to icon and list views, including Nautilus choosers.
++- Separate the virtual icon-row model and grouped rendering/input controller.
++- Keep folders-first within sections, live header updates, and folder preferences.
+ 
+ Major Changes in 50.1
+ =====================
+diff --git a/po/POTFILES.in b/po/POTFILES.in
+index 88027d5..92c21eb 100644
+--- a/po/POTFILES.in
++++ b/po/POTFILES.in
+@@ -41,6 +41,7 @@ src/nautilus-floating-bar.c
+ src/nautilus-global-preferences.c
+ src/nautilus-grid-view.c
+ src/nautilus-grid-view-captions-dialog.c
++src/nautilus-grouped-grid.c
+ src/nautilus-internal-place-file.c
+ src/nautilus-list-view.c
+ src/nautilus-location-banner.c
+diff --git a/src/meson.build b/src/meson.build
+index bad0da5..127da8f 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -118,10 +118,14 @@ libnautilus_sources = [
+   'nautilus-global-preferences.h',
+   'nautilus-grid-cell.c',
+   'nautilus-grid-cell.h',
++  'nautilus-grid-row-model.c',
++  'nautilus-grid-row-model.h',
+   'nautilus-grid-view.c',
+   'nautilus-grid-view.h',
+   'nautilus-grid-view-captions-dialog.c',
+   'nautilus-grid-view-captions-dialog.h',
++  'nautilus-grouped-grid.c',
++  'nautilus-grouped-grid.h',
+   'nautilus-hash-queue.c',
+   'nautilus-hash-queue.h',
+   'nautilus-history-controls.c',
+diff --git a/src/nautilus-files-view.c b/src/nautilus-files-view.c
+index ef39e4d..f53a6d9 100644
+--- a/src/nautilus-files-view.c
++++ b/src/nautilus-files-view.c
+@@ -616,7 +616,7 @@ supports_grouping (NautilusFilesView *self)
+     NautilusFile *file = self->directory_as_file;
+ 
+     return file != NULL &&
+-           NAUTILUS_IS_LIST_VIEW (self->list_base) &&
++           (NAUTILUS_IS_GRID_VIEW (self->list_base) || NAUTILUS_IS_LIST_VIEW (self->list_base)) &&
+            !nautilus_file_is_in_search (file) &&
+            !nautilus_file_is_in_recent (file) &&
+            !nautilus_file_is_in_trash (file) &&
+diff --git a/src/nautilus-grid-row-model.c b/src/nautilus-grid-row-model.c
+new file mode 100644
+index 0000000..7f8f148
+--- /dev/null
++++ b/src/nautilus-grid-row-model.c
+@@ -0,0 +1,438 @@
++/*
++ * Copyright (C) 2022 The GNOME project contributors
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#include "nautilus-grid-row-model.h"
++
++typedef struct
++{
++    guint start_index;       /* Global file index in NautilusViewModel */
++    guint n_items;           /* Number of items in this row */
++    guint section_start_row; /* Index of first row in this section */
++    guint section_end_row;   /* One past last row in this section */
++    NautilusGridRow *item;
++} GridRowEntry;
++
++/* --- NautilusGridRow --- */
++
++struct _NautilusGridRow
++{
++    GObject parent_instance;
++
++    NautilusViewModel *model;
++    guint start_index;
++    guint n_items;
++    gboolean starts_section;
++};
++
++G_DEFINE_TYPE (NautilusGridRow, nautilus_grid_row, G_TYPE_OBJECT)
++
++static void
++nautilus_grid_row_dispose (GObject *object)
++{
++    NautilusGridRow *self = NAUTILUS_GRID_ROW (object);
++
++    g_clear_object (&self->model);
++    G_OBJECT_CLASS (nautilus_grid_row_parent_class)->dispose (object);
++}
++
++static void
++nautilus_grid_row_class_init (NautilusGridRowClass *klass)
++{
++    G_OBJECT_CLASS (klass)->dispose = nautilus_grid_row_dispose;
++}
++
++static void
++nautilus_grid_row_init (NautilusGridRow *self)
++{
++}
++
++static NautilusGridRow *
++nautilus_grid_row_new (NautilusViewModel *model,
++                       guint              start_index,
++                       guint              n_items,
++                       gboolean           starts_section)
++{
++    NautilusGridRow *self = g_object_new (NAUTILUS_TYPE_GRID_ROW, NULL);
++
++    self->model = g_object_ref (model);
++    self->start_index = start_index;
++    self->n_items = n_items;
++    self->starts_section = starts_section;
++
++    return self;
++}
++
++guint
++nautilus_grid_row_get_start_index (NautilusGridRow *self)
++{
++    g_return_val_if_fail (NAUTILUS_IS_GRID_ROW (self), 0);
++
++    return self->start_index;
++}
++
++guint
++nautilus_grid_row_get_n_items (NautilusGridRow *self)
++{
++    g_return_val_if_fail (NAUTILUS_IS_GRID_ROW (self), 0);
++
++    return self->n_items;
++}
++
++gboolean
++nautilus_grid_row_get_starts_section (NautilusGridRow *self)
++{
++    g_return_val_if_fail (NAUTILUS_IS_GRID_ROW (self), FALSE);
++
++    return self->starts_section;
++}
++
++GtkTreeListRow *
++nautilus_grid_row_get_first_row (NautilusGridRow *self)
++{
++    g_return_val_if_fail (NAUTILUS_IS_GRID_ROW (self), NULL);
++
++    if (self->model == NULL || self->n_items == 0)
++    {
++        return NULL;
++    }
++
++    return GTK_TREE_LIST_ROW (g_list_model_get_item (G_LIST_MODEL (self->model), self->start_index));
++}
++
++/* --- NautilusGridRowModel --- */
++
++struct _NautilusGridRowModel
++{
++    GObject parent_instance;
++
++    NautilusViewModel *base_model;
++    GArray *rows; /* Array of GridRowEntry */
++    guint n_columns;
++};
++
++static void nautilus_grid_row_model_list_model_init (GListModelInterface *iface);
++static void nautilus_grid_row_model_section_model_init (GtkSectionModelInterface *iface);
++
++G_DEFINE_TYPE_WITH_CODE (NautilusGridRowModel, nautilus_grid_row_model, G_TYPE_OBJECT,
++                         G_IMPLEMENT_INTERFACE (G_TYPE_LIST_MODEL,
++                                                nautilus_grid_row_model_list_model_init)
++                         G_IMPLEMENT_INTERFACE (GTK_TYPE_SECTION_MODEL,
++                                                nautilus_grid_row_model_section_model_init))
++
++static GType
++nautilus_grid_row_model_get_item_type (GListModel *list_model)
++{
++    return NAUTILUS_TYPE_GRID_ROW;
++}
++
++static guint
++nautilus_grid_row_model_get_n_items (GListModel *list_model)
++{
++    NautilusGridRowModel *self = NAUTILUS_GRID_ROW_MODEL (list_model);
++
++    return self->rows != NULL ? self->rows->len : 0;
++}
++
++static gpointer
++nautilus_grid_row_model_get_item (GListModel *list_model,
++                                  guint       position)
++{
++    NautilusGridRowModel *self = NAUTILUS_GRID_ROW_MODEL (list_model);
++
++    if (self->rows == NULL || position >= self->rows->len)
++    {
++        return NULL;
++    }
++
++    GridRowEntry *entry = &g_array_index (self->rows, GridRowEntry, position);
++
++    if (entry->item == NULL)
++    {
++        entry->item = nautilus_grid_row_new (self->base_model, entry->start_index, entry->n_items,
++                                             position == entry->section_start_row);
++    }
++    return g_object_ref (entry->item);
++}
++
++static void
++nautilus_grid_row_model_list_model_init (GListModelInterface *iface)
++{
++    iface->get_item_type = nautilus_grid_row_model_get_item_type;
++    iface->get_n_items = nautilus_grid_row_model_get_n_items;
++    iface->get_item = nautilus_grid_row_model_get_item;
++}
++
++static void
++nautilus_grid_row_model_get_section (GtkSectionModel *model,
++                                     guint            position,
++                                     guint           *out_start,
++                                     guint           *out_end)
++{
++    NautilusGridRowModel *self = NAUTILUS_GRID_ROW_MODEL (model);
++    guint n_rows = self->rows != NULL ? self->rows->len : 0;
++
++    if (position >= n_rows)
++    {
++        *out_start = n_rows;
++        *out_end = G_MAXUINT;
++        return;
++    }
++
++    GridRowEntry *entry = &g_array_index (self->rows, GridRowEntry, position);
++    *out_start = entry->section_start_row;
++    *out_end = entry->section_end_row;
++}
++
++static void
++nautilus_grid_row_model_section_model_init (GtkSectionModelInterface *iface)
++{
++    iface->get_section = nautilus_grid_row_model_get_section;
++}
++
++static void
++grid_row_entry_clear (gpointer data)
++{
++    GridRowEntry *entry = data;
++
++    g_clear_object (&entry->item);
++}
++
++static void
++nautilus_grid_row_model_rebuild (NautilusGridRowModel *self)
++{
++    guint old_n_rows = self->rows != NULL ? self->rows->len : 0;
++
++    if (self->rows == NULL)
++    {
++        self->rows = g_array_new (FALSE, FALSE, sizeof (GridRowEntry));
++        g_array_set_clear_func (self->rows, grid_row_entry_clear);
++    }
++    else
++    {
++        g_array_set_size (self->rows, 0);
++    }
++
++    if (self->base_model == NULL || self->n_columns == 0)
++    {
++        if (old_n_rows > 0)
++        {
++            g_list_model_items_changed (G_LIST_MODEL (self), 0, old_n_rows, 0);
++        }
++        return;
++    }
++
++    guint total_items = g_list_model_get_n_items (G_LIST_MODEL (self->base_model));
++    guint pos = 0;
++
++    while (pos < total_items)
++    {
++        guint sec_start = pos;
++        guint sec_end = total_items;
++
++        gtk_section_model_get_section (GTK_SECTION_MODEL (self->base_model), pos, &sec_start, &sec_end);
++        sec_end = MIN (sec_end, total_items);
++
++        if (sec_end <= pos || sec_start > pos)
++        {
++            sec_start = pos;
++            sec_end = total_items;
++        }
++
++        guint sec_n_items = sec_end - sec_start;
++        guint sec_n_rows = (sec_n_items + self->n_columns - 1) / self->n_columns;
++        guint current_row_start = self->rows->len;
++        guint current_row_end = current_row_start + sec_n_rows;
++
++        for (guint r = 0; r < sec_n_rows; r++)
++        {
++            GridRowEntry entry = { 0 };
++            entry.start_index = sec_start + r * self->n_columns;
++            entry.n_items = MIN (self->n_columns, sec_end - entry.start_index);
++            entry.section_start_row = current_row_start;
++            entry.section_end_row = current_row_end;
++            g_array_append_val (self->rows, entry);
++        }
++
++        pos = sec_end;
++    }
++
++    guint new_n_rows = self->rows->len;
++    g_list_model_items_changed (G_LIST_MODEL (self), 0, old_n_rows, new_n_rows);
++    if (new_n_rows > 0)
++    {
++        gtk_section_model_sections_changed (GTK_SECTION_MODEL (self), 0, new_n_rows);
++    }
++}
++
++static void
++on_base_model_changed (NautilusGridRowModel *self)
++{
++    nautilus_grid_row_model_rebuild (self);
++}
++
++static void
++nautilus_grid_row_model_dispose (GObject *object)
++{
++    NautilusGridRowModel *self = NAUTILUS_GRID_ROW_MODEL (object);
++
++    if (self->base_model != NULL)
++    {
++        g_signal_handlers_disconnect_by_func (self->base_model, on_base_model_changed, self);
++        g_clear_object (&self->base_model);
++    }
++
++    if (self->rows != NULL)
++    {
++        g_array_free (self->rows, TRUE);
++        self->rows = NULL;
++    }
++
++    G_OBJECT_CLASS (nautilus_grid_row_model_parent_class)->dispose (object);
++}
++
++static void
++nautilus_grid_row_model_class_init (NautilusGridRowModelClass *klass)
++{
++    GObjectClass *object_class = G_OBJECT_CLASS (klass);
++
++    object_class->dispose = nautilus_grid_row_model_dispose;
++}
++
++static void
++nautilus_grid_row_model_init (NautilusGridRowModel *self)
++{
++    self->n_columns = 4;
++}
++
++NautilusGridRowModel *
++nautilus_grid_row_model_new (void)
++{
++    return g_object_new (NAUTILUS_TYPE_GRID_ROW_MODEL, NULL);
++}
++
++void
++nautilus_grid_row_model_set_base_model (NautilusGridRowModel *self,
++                                        NautilusViewModel    *base_model)
++{
++    g_return_if_fail (NAUTILUS_IS_GRID_ROW_MODEL (self));
++    g_return_if_fail (base_model == NULL || NAUTILUS_IS_VIEW_MODEL (base_model));
++
++    if (self->base_model == base_model)
++    {
++        return;
++    }
++
++    if (self->base_model != NULL)
++    {
++        g_signal_handlers_disconnect_by_func (self->base_model, on_base_model_changed, self);
++        g_clear_object (&self->base_model);
++    }
++
++    if (base_model != NULL)
++    {
++        self->base_model = g_object_ref (base_model);
++        g_signal_connect_swapped (self->base_model, "items-changed",
++                                  G_CALLBACK (on_base_model_changed), self);
++        g_signal_connect_swapped (self->base_model, "sections-changed",
++                                  G_CALLBACK (on_base_model_changed), self);
++    }
++
++    nautilus_grid_row_model_rebuild (self);
++}
++
++void
++nautilus_grid_row_model_set_n_columns (NautilusGridRowModel *self,
++                                       guint                 n_columns)
++{
++    g_return_if_fail (NAUTILUS_IS_GRID_ROW_MODEL (self));
++
++    if (self->n_columns == n_columns || n_columns == 0)
++    {
++        return;
++    }
++
++    self->n_columns = n_columns;
++    nautilus_grid_row_model_rebuild (self);
++}
++
++gboolean
++nautilus_grid_row_model_get_coords (NautilusGridRowModel *self,
++                                    guint                 pos,
++                                    guint                *out_row,
++                                    guint                *out_col)
++{
++    g_return_val_if_fail (NAUTILUS_IS_GRID_ROW_MODEL (self), FALSE);
++
++    if (self->rows == NULL || self->rows->len == 0)
++    {
++        return FALSE;
++    }
++
++    guint low = 0;
++    guint high = self->rows->len - 1;
++
++    while (low <= high)
++    {
++        guint mid = low + (high - low) / 2;
++        GridRowEntry *entry = &g_array_index (self->rows, GridRowEntry, mid);
++
++        if (pos >= entry->start_index && pos < entry->start_index + entry->n_items)
++        {
++            if (out_row != NULL)
++            {
++                *out_row = mid;
++            }
++            if (out_col != NULL)
++            {
++                *out_col = pos - entry->start_index;
++            }
++            return TRUE;
++        }
++        else if (pos < entry->start_index)
++        {
++            if (mid == 0)
++            {
++                break;
++            }
++            high = mid - 1;
++        }
++        else
++        {
++            low = mid + 1;
++        }
++    }
++
++    return FALSE;
++}
++
++gint
++nautilus_grid_row_model_get_position_at (NautilusGridRowModel *self,
++                                         guint                 row,
++                                         guint                 col)
++{
++    g_return_val_if_fail (NAUTILUS_IS_GRID_ROW_MODEL (self), -1);
++
++    if (self->rows == NULL || row >= self->rows->len)
++    {
++        return -1;
++    }
++
++    GridRowEntry *entry = &g_array_index (self->rows, GridRowEntry, row);
++    if (col >= entry->n_items)
++    {
++        col = entry->n_items > 0 ? entry->n_items - 1 : 0;
++    }
++
++    return (gint) (entry->start_index + col);
++}
++
++guint
++nautilus_grid_row_model_get_n_rows (NautilusGridRowModel *self)
++{
++    g_return_val_if_fail (NAUTILUS_IS_GRID_ROW_MODEL (self), 0);
++
++    return self->rows != NULL ? self->rows->len : 0;
++}
+diff --git a/src/nautilus-grid-row-model.h b/src/nautilus-grid-row-model.h
+new file mode 100644
+index 0000000..50653a5
+--- /dev/null
++++ b/src/nautilus-grid-row-model.h
+@@ -0,0 +1,42 @@
++/*
++ * Copyright (C) 2022 The GNOME project contributors
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#pragma once
++
++#include "nautilus-view-model.h"
++
++#include <gtk/gtk.h>
++
++G_BEGIN_DECLS
++
++#define NAUTILUS_TYPE_GRID_ROW (nautilus_grid_row_get_type ())
++G_DECLARE_FINAL_TYPE (NautilusGridRow, nautilus_grid_row, NAUTILUS, GRID_ROW, GObject)
++
++#define NAUTILUS_TYPE_GRID_ROW_MODEL (nautilus_grid_row_model_get_type ())
++G_DECLARE_FINAL_TYPE (NautilusGridRowModel, nautilus_grid_row_model, NAUTILUS, GRID_ROW_MODEL, GObject)
++
++/* NautilusGridRow accessors */
++guint              nautilus_grid_row_get_start_index    (NautilusGridRow *self);
++guint              nautilus_grid_row_get_n_items        (NautilusGridRow *self);
++gboolean           nautilus_grid_row_get_starts_section (NautilusGridRow *self);
++GtkTreeListRow    *nautilus_grid_row_get_first_row      (NautilusGridRow *self);
++
++/* NautilusGridRowModel methods */
++NautilusGridRowModel *nautilus_grid_row_model_new             (void);
++void                  nautilus_grid_row_model_set_base_model  (NautilusGridRowModel *self,
++                                                               NautilusViewModel    *base_model);
++void                  nautilus_grid_row_model_set_n_columns   (NautilusGridRowModel *self,
++                                                               guint                 n_columns);
++gboolean              nautilus_grid_row_model_get_coords      (NautilusGridRowModel *self,
++                                                               guint                 pos,
++                                                               guint                *out_row,
++                                                               guint                *out_col);
++gint                  nautilus_grid_row_model_get_position_at (NautilusGridRowModel *self,
++                                                               guint                 row,
++                                                               guint                 col);
++guint                 nautilus_grid_row_model_get_n_rows      (NautilusGridRowModel *self);
++
++G_END_DECLS
+diff --git a/src/nautilus-grid-view.c b/src/nautilus-grid-view.c
+index 362d3cc..c7f8430 100644
+--- a/src/nautilus-grid-view.c
++++ b/src/nautilus-grid-view.c
+@@ -9,7 +9,9 @@
+ #include "nautilus-file.h"
+ #include "nautilus-global-preferences.h"
+ #include "nautilus-grid-cell.h"
++#include "nautilus-grouped-grid.h"
+ #include "nautilus-list-base-private.h"
++#include "nautilus-ui-utilities.h"
+ #include "nautilus-view-cell.h"
+ #include "nautilus-view-item.h"
+ #include "nautilus-view-model.h"
+@@ -21,7 +23,9 @@ struct _NautilusGridView
+     NautilusListBase parent_instance;
+ 
+     GtkGridView *view_ui;
++    NautilusGroupedGrid *grouped_grid;
+ 
++    guint n_columns;
+     gint zoom_level;
+ 
+     gboolean directories_first;
+@@ -164,7 +168,7 @@ set_captions_from_preferences (NautilusGridView *self)
+     value = g_settings_get_strv (nautilus_icon_view_preferences,
+                                  NAUTILUS_PREFERENCES_ICON_VIEW_CAPTIONS);
+ 
+-    /* Set a celling on the number of captions depending on the zoom level. */
++    /* Set a ceiling on the number of captions depending on the zoom level. */
+     n_captions_for_zoom_level = MIN ((uint) self->zoom_level + 1,
+                                      G_N_ELEMENTS (self->caption_attributes));
+ 
+@@ -186,6 +190,34 @@ set_captions_from_preferences (NautilusGridView *self)
+     }
+ }
+ 
++static void
++update_columns_for_width (NautilusGridView *self,
++                          int               width)
++{
++    if (width <= 0)
++    {
++        return;
++    }
++
++    guint icon_size = get_icon_size_for_zoom_level (self->zoom_level);
++    /* Width of a cell: EMBLEMS_BOX_WIDTH (18) * 2 + icon_size + 12px cell padding = icon_size + 48 */
++    int cell_width = 36 + (int) icon_size + 12;
++    int slot_width = cell_width + 12; /* Horizontal spacing */
++    int available = width - 36;        /* View padding */
++    int columns = available > 0 ? (available / slot_width) : 1;
++
++    columns = CLAMP (columns, 1, 20);
++
++    if ((guint) columns != self->n_columns)
++    {
++        self->n_columns = (guint) columns;
++        if (self->grouped_grid != NULL)
++        {
++            nautilus_grouped_grid_set_n_columns (self->grouped_grid, self->n_columns);
++        }
++    }
++}
++
+ static void
+ real_set_zoom_level (NautilusListBase *list_base,
+                      int               new_level)
+@@ -205,28 +237,43 @@ real_set_zoom_level (NautilusListBase *list_base,
+                              new_level);
+     }
+ 
+-    /* The zoom level may change how many captions are allowed. Update it before
+-     * notifying the icon size change, under the assumption that NautilusGridCell
+-     * updates captions whenever the icon size is set*/
+     set_captions_from_preferences (self);
+ 
++    if (self->grouped_grid != NULL)
++    {
++        nautilus_grouped_grid_set_zoom_level (self->grouped_grid, new_level);
++        nautilus_grouped_grid_set_caption_attributes (self->grouped_grid, self->caption_attributes);
++    }
++
+     g_object_notify (G_OBJECT (self), "icon-size");
++
++    int width = gtk_widget_get_width (GTK_WIDGET (self));
++    if (width > 0)
++    {
++        update_columns_for_width (self, width);
++    }
+ }
+ 
+-/* The generic implementation in src/nautilus-list-base.c doesn't allow the
+- * 2-dimensional movements expected from a grid. Let's hack GTK here. */
+ static void
+ real_preview_selection_event (NautilusListBase *list_base,
+                               GtkDirectionType  direction)
+ {
+     NautilusGridView *self = NAUTILUS_GRID_VIEW (list_base);
++
++    if (nautilus_list_base_get_grouping_mode (list_base) != NAUTILUS_GROUPING_NONE)
++    {
++        if (self->grouped_grid != NULL)
++        {
++            nautilus_grouped_grid_preview_selection_event (self->grouped_grid, direction);
++        }
++        return;
++    }
++
+     guint direction_keyval;
+     g_autoptr (GtkShortcutTrigger) direction_trigger = NULL;
+     g_autoptr (GListModel) controllers = NULL;
+     gboolean success = FALSE;
+ 
+-    /* We want the same behavior as when the user presses the arrow keys while
+-     * the focus is in the view. So, let's get the matching arrow key. */
+     switch (direction)
+     {
+         case GTK_DIR_UP:
+@@ -259,15 +306,8 @@ real_preview_selection_event (NautilusListBase *list_base,
+         }
+     }
+ 
+-    /* We cannot simulate a click, but we can find the shortcut it triggers and
+-     * activate its action programatically.
+-     *
+-     * First, we create out would-be trigger.*/
+     direction_trigger = gtk_keyval_trigger_new (direction_keyval, 0);
+ 
+-    /* Then we iterate over the shortcut installed in GtkGridView until we find
+-     * a matching trigger. There may be multiple shortcut controllers, and each
+-     * shortcut controller may hold multiple shortcuts each. Let's loop. */
+     controllers = gtk_widget_observe_controllers (GTK_WIDGET (self->view_ui));
+     for (guint i = 0; i < g_list_model_get_n_items (controllers); i++)
+     {
+@@ -285,7 +325,6 @@ real_preview_selection_event (NautilusListBase *list_base,
+ 
+             if (gtk_shortcut_trigger_equal (trigger, direction_trigger))
+             {
+-                /* Match found. Activate the action to move cursor. */
+                 success = gtk_shortcut_action_activate (gtk_shortcut_get_action (shortcut),
+                                                         0,
+                                                         GTK_WIDGET (self->view_ui),
+@@ -295,7 +334,6 @@ real_preview_selection_event (NautilusListBase *list_base,
+         }
+     }
+ 
+-    /* If the hack fails (GTK may change it's internal behavior), fallback. */
+     if (!success)
+     {
+         g_warning_once ("GTK shortcut behavior has changed, manual shortcut method failed");
+@@ -303,14 +341,6 @@ real_preview_selection_event (NautilusListBase *list_base,
+     }
+ }
+ 
+-/* We only care about the keyboard activation part that GtkGridView provides,
+- * but we don't need any special filtering here. Indeed, we ask GtkGridView
+- * to not activate on single click, and we get to handle double clicks before
+- * GtkGridView does (as one of widget subclassing's goal is to modify the parent
+- * class's behavior), while claiming the click gestures, so it means GtkGridView
+- * will never react to a click event to emit this signal. So we should be pretty
+- * safe here with regards to our custom item click handling.
+- */
+ static void
+ on_grid_view_item_activated (GtkGridView *grid_view,
+                              guint        position,
+@@ -345,7 +375,17 @@ real_scroll_to (NautilusListBase   *list_base_view,
+ {
+     NautilusGridView *self = NAUTILUS_GRID_VIEW (list_base_view);
+ 
+-    gtk_grid_view_scroll_to (self->view_ui, position, flags, scroll);
++    if (nautilus_list_base_get_grouping_mode (list_base_view) != NAUTILUS_GROUPING_NONE)
++    {
++        if (self->grouped_grid != NULL)
++        {
++            nautilus_grouped_grid_scroll_to (self->grouped_grid, position, flags, scroll);
++        }
++    }
++    else
++    {
++        gtk_grid_view_scroll_to (self->view_ui, position, flags, scroll);
++    }
+ }
+ 
+ static GVariant *
+@@ -365,6 +405,10 @@ real_set_enable_rubberband (NautilusListBase *list_base,
+     NautilusGridView *self = NAUTILUS_GRID_VIEW (list_base);
+ 
+     gtk_grid_view_set_enable_rubberband (self->view_ui, enabled);
++    if (self->grouped_grid != NULL)
++    {
++        nautilus_grouped_grid_set_enable_rubberband (self->grouped_grid, enabled);
++    }
+ }
+ 
+ static void
+@@ -391,6 +435,11 @@ on_captions_preferences_changed (NautilusGridView *self)
+ {
+     set_captions_from_preferences (self);
+ 
++    if (self->grouped_grid != NULL)
++    {
++        nautilus_grouped_grid_set_caption_attributes (self->grouped_grid, self->caption_attributes);
++    }
++
+     /* Hack: this relies on the assumption that NautilusGridCell updates
+      * captions whenever the icon size is set (even if it's the same value). */
+     g_object_notify (G_OBJECT (self), "icon-size");
+@@ -399,6 +448,15 @@ on_captions_preferences_changed (NautilusGridView *self)
+ static void
+ dispose (GObject *object)
+ {
++    NautilusGridView *self = NAUTILUS_GRID_VIEW (object);
++
++    if (self->grouped_grid != NULL)
++    {
++        nautilus_grouped_grid_set_model (self->grouped_grid, NULL);
++    }
++    g_clear_object (&self->grouped_grid);
++    g_clear_object (&self->view_ui);
++
+     G_OBJECT_CLASS (nautilus_grid_view_parent_class)->dispose (object);
+ }
+ 
+@@ -408,6 +466,8 @@ finalize (GObject *object)
+     G_OBJECT_CLASS (nautilus_grid_view_parent_class)->finalize (object);
+ }
+ 
++/* --- Ungrouped GtkGridView Setup --- */
++
+ static void
+ bind_cell (GtkSignalListItemFactory *factory,
+            GtkListItem              *listitem,
+@@ -426,9 +486,6 @@ bind_cell (GtkSignalListItemFactory *factory,
+     {
+         GtkWidget *parent;
+ 
+-        /* At the time of ::setup emission, the item ui has got no parent yet,
+-         * that's why we need to complete the widget setup process here, on the
+-         * first time ::bind is emitted. */
+         parent = gtk_widget_get_parent (cell);
+         gtk_widget_set_halign (parent, GTK_ALIGN_CENTER);
+         gtk_widget_set_valign (parent, GTK_ALIGN_START);
+@@ -444,8 +501,7 @@ unbind_cell (GtkSignalListItemFactory *factory,
+ 
+     item = get_view_item (listitem);
+ 
+-    /* item may be NULL when row has just been destroyed. */
+-    if (item != NULL)
++    if (item != NULL && nautilus_view_item_get_item_ui (item) == gtk_list_item_get_child (listitem))
+     {
+         nautilus_view_item_set_item_ui (item, NULL);
+     }
+@@ -471,8 +527,6 @@ setup_cell (GtkSignalListItemFactory *factory,
+ 
+     nautilus_grid_cell_set_caption_attributes (cell, self->caption_attributes);
+ 
+-    /* Use file display name as accessible label. Explaining in pseudo-code:
+-     * listitem:accessible-name :- listitem:item:item:file:a11y-name */
+     expression = gtk_property_expression_new (GTK_TYPE_LIST_ITEM, NULL, "item");
+     expression = gtk_property_expression_new (GTK_TYPE_TREE_LIST_ROW, expression, "item");
+     expression = gtk_property_expression_new (NAUTILUS_TYPE_VIEW_ITEM, expression, "file");
+@@ -484,15 +538,50 @@ static void
+ on_model_changed (NautilusGridView *self)
+ {
+     NautilusViewModel *model = nautilus_list_base_get_model (NAUTILUS_LIST_BASE (self));
++    gboolean grouped = (nautilus_list_base_get_grouping_mode (NAUTILUS_LIST_BASE (self)) != NAUTILUS_GROUPING_NONE);
+ 
+     if (model != NULL)
+     {
+-        gtk_grid_view_set_enable_rubberband (GTK_GRID_VIEW (self->view_ui),
+-                                             !nautilus_view_model_get_single_selection (model));
++        real_set_enable_rubberband (NAUTILUS_LIST_BASE (self),
++                                    !nautilus_view_model_get_single_selection (model));
+     }
+ 
+-    gtk_grid_view_set_model (self->view_ui, GTK_SELECTION_MODEL (model));
++    gtk_grid_view_set_model (self->view_ui,
++                             grouped ? NULL : GTK_SELECTION_MODEL (model));
++    if (self->grouped_grid != NULL)
++    {
++        nautilus_grouped_grid_set_model (self->grouped_grid, grouped ? model : NULL);
++    }
++}
++
++static void
++on_grouping_mode_changed (NautilusGridView *self)
++{
++    gboolean grouped = (nautilus_list_base_get_grouping_mode (NAUTILUS_LIST_BASE (self)) != NAUTILUS_GROUPING_NONE);
++    GtkWidget *scrolled_window = nautilus_list_base_get_scrolled_window (NAUTILUS_LIST_BASE (self));
++    NautilusViewModel *model = nautilus_list_base_get_model (NAUTILUS_LIST_BASE (self));
++
++    gtk_widget_set_focusable (GTK_WIDGET (self), grouped);
++
++    gtk_grid_view_set_model (self->view_ui, grouped ? NULL : GTK_SELECTION_MODEL (model));
++    if (self->grouped_grid != NULL)
++    {
++        nautilus_grouped_grid_set_model (self->grouped_grid, grouped ? model : NULL);
++    }
++
++    if (grouped)
++    {
++        GtkWidget *grouped_widget = nautilus_grouped_grid_get_widget (self->grouped_grid);
++        gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scrolled_window),
++                                       grouped_widget);
++    }
++    else
++    {
++        gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scrolled_window),
++                                       GTK_WIDGET (self->view_ui));
++    }
+ }
++
+ static GtkGridView *
+ create_view_ui (NautilusGridView *self)
+ {
+@@ -506,12 +595,6 @@ create_view_ui (NautilusGridView *self)
+ 
+     widget = gtk_grid_view_new (NULL, factory);
+ 
+-    /* We don't use the built-in child activation feature for clicks because it
+-     * doesn't fill all our needs nor does it match our expected behavior.
+-     * Instead, we roll our own event handling and double/single click mode.
+-     * However, GtkGridView:single-click-activate has other effects besides
+-     * activation, as it affects the selection behavior as well (e.g. selects on
+-     * hover). Setting it to FALSE gives us the expected behavior. */
+     gtk_grid_view_set_single_click_activate (GTK_GRID_VIEW (widget), FALSE);
+     gtk_grid_view_set_max_columns (GTK_GRID_VIEW (widget), 20);
+     gtk_grid_view_set_tab_behavior (GTK_GRID_VIEW (widget), GTK_LIST_TAB_ITEM);
+@@ -523,23 +606,131 @@ create_view_ui (NautilusGridView *self)
+                                     _("View of the current location"),
+                                     -1);
+ 
+-    /* While we don't want to use GTK's click activation, we'll let it handle
+-     * the key activation part (with Enter).
+-     */
+     g_signal_connect (widget, "activate", G_CALLBACK (on_grid_view_item_activated), self);
+ 
+     return GTK_GRID_VIEW (widget);
+ }
+ 
++/* AdwBin uses a layout manager, so its subclasses' size_allocate vfunc is not
++ * called. Allocate the bin child here and reflow virtual rows before it lays out. */
++#define NAUTILUS_TYPE_GRID_LAYOUT (nautilus_grid_layout_get_type ())
++G_DECLARE_FINAL_TYPE (NautilusGridLayout, nautilus_grid_layout, NAUTILUS, GRID_LAYOUT, GtkLayoutManager)
++
++struct _NautilusGridLayout
++{
++    GtkLayoutManager parent_instance;
++};
++
++G_DEFINE_TYPE (NautilusGridLayout, nautilus_grid_layout, GTK_TYPE_LAYOUT_MANAGER)
++
++static GtkSizeRequestMode
++grid_layout_get_request_mode (GtkLayoutManager *manager,
++                              GtkWidget        *widget)
++{
++    GtkWidget *child = adw_bin_get_child (ADW_BIN (widget));
++
++    return child != NULL ? gtk_widget_get_request_mode (child) : GTK_SIZE_REQUEST_CONSTANT_SIZE;
++}
++
++static void
++grid_layout_measure (GtkLayoutManager *manager,
++                     GtkWidget        *widget,
++                     GtkOrientation    orientation,
++                     int               for_size,
++                     int              *minimum,
++                     int              *natural,
++                     int              *minimum_baseline,
++                     int              *natural_baseline)
++{
++    GtkWidget *child = adw_bin_get_child (ADW_BIN (widget));
++
++    if (child != NULL && gtk_widget_should_layout (child))
++    {
++        gtk_widget_measure (child, orientation, for_size, minimum, natural,
++                            minimum_baseline, natural_baseline);
++    }
++    else
++    {
++        *minimum = *natural = 0;
++        *minimum_baseline = *natural_baseline = -1;
++    }
++}
++
++static void
++grid_layout_allocate (GtkLayoutManager *manager,
++                      GtkWidget        *widget,
++                      int               width,
++                      int               height,
++                      int               baseline)
++{
++    GtkWidget *child = adw_bin_get_child (ADW_BIN (widget));
++
++    update_columns_for_width (NAUTILUS_GRID_VIEW (widget), width);
++    if (child != NULL && gtk_widget_should_layout (child))
++    {
++        gtk_widget_allocate (child, width, height, baseline, NULL);
++    }
++}
++
++static void
++nautilus_grid_layout_class_init (NautilusGridLayoutClass *klass)
++{
++    GtkLayoutManagerClass *layout_class = GTK_LAYOUT_MANAGER_CLASS (klass);
++
++    layout_class->get_request_mode = grid_layout_get_request_mode;
++    layout_class->measure = grid_layout_measure;
++    layout_class->allocate = grid_layout_allocate;
++}
++
++static void
++nautilus_grid_layout_init (NautilusGridLayout *self)
++{
++}
++
++static gboolean
++nautilus_grid_view_grab_focus (GtkWidget *widget)
++{
++    if (nautilus_list_base_get_grouping_mode (NAUTILUS_LIST_BASE (widget)) != NAUTILUS_GROUPING_NONE)
++    {
++        GtkRoot *root = gtk_widget_get_root (widget);
++
++        if (root == NULL)
++        {
++            return FALSE;
++        }
++        gtk_root_set_focus (root, widget);
++        return gtk_widget_has_focus (widget);
++    }
++
++    return GTK_WIDGET_CLASS (nautilus_grid_view_parent_class)->grab_focus (widget);
++}
++
++static gboolean
++nautilus_grid_view_focus (GtkWidget        *widget,
++                          GtkDirectionType  direction)
++{
++    if (nautilus_list_base_get_grouping_mode (NAUTILUS_LIST_BASE (widget)) != NAUTILUS_GROUPING_NONE)
++    {
++        return !gtk_widget_has_focus (widget) && gtk_widget_grab_focus (widget);
++    }
++
++    return GTK_WIDGET_CLASS (nautilus_grid_view_parent_class)->focus (widget, direction);
++}
++
+ static void
+ nautilus_grid_view_class_init (NautilusGridViewClass *klass)
+ {
+     GObjectClass *object_class = G_OBJECT_CLASS (klass);
++    GtkWidgetClass *widget_class = GTK_WIDGET_CLASS (klass);
+     NautilusListBaseClass *list_base_view_class = NAUTILUS_LIST_BASE_CLASS (klass);
+ 
+     object_class->dispose = dispose;
+     object_class->finalize = finalize;
+ 
++    gtk_widget_class_set_layout_manager_type (widget_class, NAUTILUS_TYPE_GRID_LAYOUT);
++    widget_class->grab_focus = nautilus_grid_view_grab_focus;
++    widget_class->focus = nautilus_grid_view_focus;
++
+     list_base_view_class->get_icon_size = real_get_icon_size;
+     list_base_view_class->get_sort_state = real_get_sort_state;
+     list_base_view_class->get_view_info = real_get_view_info;
+@@ -558,6 +749,7 @@ nautilus_grid_view_init (NautilusGridView *self)
+     GtkWidget *scrolled_window = nautilus_list_base_get_scrolled_window (NAUTILUS_LIST_BASE (self));
+ 
+     gtk_widget_add_css_class (GTK_WIDGET (self), "nautilus-grid-view");
++    gtk_widget_set_focusable (GTK_WIDGET (self), FALSE);
+ 
+     set_captions_from_preferences (self);
+     g_signal_connect_object (nautilus_icon_view_preferences,
+@@ -566,11 +758,17 @@ nautilus_grid_view_init (NautilusGridView *self)
+                              self,
+                              G_CONNECT_SWAPPED);
+ 
++    self->n_columns = 4;
++
++    self->view_ui = g_object_ref_sink (create_view_ui (self));
++    self->grouped_grid = nautilus_grouped_grid_new (NAUTILUS_LIST_BASE (self));
++    nautilus_grouped_grid_set_n_columns (self->grouped_grid, self->n_columns);
++    nautilus_grouped_grid_set_caption_attributes (self->grouped_grid, self->caption_attributes);
+ 
+-    self->view_ui = create_view_ui (self);
+     nautilus_list_base_setup_gestures (NAUTILUS_LIST_BASE (self));
+ 
+     g_signal_connect_swapped (self, "notify::model", G_CALLBACK (on_model_changed), self);
++    g_signal_connect_swapped (self, "notify::grouping-mode", G_CALLBACK (on_grouping_mode_changed), self);
+ 
+     gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scrolled_window),
+                                    GTK_WIDGET (self->view_ui));
+diff --git a/src/nautilus-grouped-grid.c b/src/nautilus-grouped-grid.c
+new file mode 100644
+index 0000000..82d806e
+--- /dev/null
++++ b/src/nautilus-grouped-grid.c
+@@ -0,0 +1,1221 @@
++/*
++ * Copyright (C) 2022 The GNOME project contributors
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#include "nautilus-grouped-grid.h"
++
++#include "nautilus-file.h"
++#include "nautilus-grid-row-model.h"
++#include "nautilus-list-base-private.h"
++#include "nautilus-view-cell.h"
++#include "nautilus-view-item.h"
++
++#include <glib/gi18n.h>
++
++struct _NautilusGroupedGrid
++{
++    GObject parent_instance;
++
++    NautilusListBase *view; /* weak pointer */
++
++    GtkListView *grouped_view_ui;
++    NautilusGridRowModel *row_model;
++
++    GHashTable *bound_slots; /* guint global_pos -> GtkWidget *slot */
++    guint anchor_position;
++    guint cursor_position;
++    guint n_columns;
++    gboolean defer_unselect_other;
++    guint defer_unselect_pos;
++
++    /* Rubberband selection */
++    gboolean rubberband_enabled;
++    GtkGestureDrag *drag_gesture;
++    GtkWidget *rubberband_widget; /* weak pointer */
++    double drag_start_x;
++    double drag_start_y;
++    GtkBitset *drag_initial_selection;
++    GtkBitset *drag_work_selection;
++    GtkBitset *drag_mask;
++    gboolean drag_toggle;
++
++    GtkEventController *key_controller;
++
++    NautilusViewModel *connected_model;
++
++    NautilusGridZoomLevel zoom_level;
++    GQuark caption_attributes[NAUTILUS_GRID_CELL_N_CAPTIONS];
++};
++
++G_DEFINE_TYPE (NautilusGroupedGrid, nautilus_grouped_grid, G_TYPE_OBJECT)
++
++static guint
++get_icon_size_for_zoom_level (NautilusGridZoomLevel zoom_level)
++{
++    switch (zoom_level)
++    {
++        case NAUTILUS_GRID_ZOOM_LEVEL_SMALL:
++        {
++            return NAUTILUS_GRID_ICON_SIZE_SMALL;
++        }
++        break;
++
++        case NAUTILUS_GRID_ZOOM_LEVEL_SMALL_PLUS:
++        {
++            return NAUTILUS_GRID_ICON_SIZE_SMALL_PLUS;
++        }
++        break;
++
++        case NAUTILUS_GRID_ZOOM_LEVEL_MEDIUM:
++        {
++            return NAUTILUS_GRID_ICON_SIZE_MEDIUM;
++        }
++        break;
++
++        case NAUTILUS_GRID_ZOOM_LEVEL_LARGE:
++        {
++            return NAUTILUS_GRID_ICON_SIZE_LARGE;
++        }
++        break;
++
++        case NAUTILUS_GRID_ZOOM_LEVEL_EXTRA_LARGE:
++        {
++            return NAUTILUS_GRID_ICON_SIZE_EXTRA_LARGE;
++        }
++        break;
++    }
++    g_return_val_if_reached (NAUTILUS_GRID_ICON_SIZE_MEDIUM);
++}
++
++static guint
++get_first_selected_position (NautilusGroupedGrid *self)
++{
++    if (self->view == NULL)
++    {
++        return GTK_INVALID_LIST_POSITION;
++    }
++
++    NautilusViewModel *model = nautilus_list_base_get_model (self->view);
++    if (model == NULL)
++    {
++        return GTK_INVALID_LIST_POSITION;
++    }
++
++    g_autoptr (GtkBitset) selection = gtk_selection_model_get_selection (GTK_SELECTION_MODEL (model));
++    if (gtk_bitset_is_empty (selection))
++    {
++        return GTK_INVALID_LIST_POSITION;
++    }
++
++    return gtk_bitset_get_minimum (selection);
++}
++
++static gboolean
++grouped_grid_handle_key (NautilusGroupedGrid *self,
++                         guint                keyval,
++                         GdkModifierType      state)
++{
++    if (self->view == NULL)
++    {
++        return GDK_EVENT_PROPAGATE;
++    }
++
++    if (nautilus_list_base_get_grouping_mode (self->view) == NAUTILUS_GROUPING_NONE)
++    {
++        return GDK_EVENT_PROPAGATE;
++    }
++
++    NautilusViewModel *model = nautilus_list_base_get_model (self->view);
++    if (model == NULL || self->row_model == NULL)
++    {
++        return GDK_EVENT_PROPAGATE;
++    }
++
++    guint total_items = g_list_model_get_n_items (G_LIST_MODEL (model));
++    if (total_items == 0)
++    {
++        return GDK_EVENT_PROPAGATE;
++    }
++
++    gboolean shift = (state & GDK_SHIFT_MASK) != 0;
++    gboolean ctrl = (state & GDK_CONTROL_MASK) != 0;
++    gboolean rtl = gtk_widget_get_direction (GTK_WIDGET (self->view)) == GTK_TEXT_DIR_RTL;
++
++    if (rtl && (keyval == GDK_KEY_Left || keyval == GDK_KEY_Right))
++    {
++        keyval = keyval == GDK_KEY_Left ? GDK_KEY_Right : GDK_KEY_Left;
++    }
++
++    /* Handle Enter to activate selection */
++    if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter)
++    {
++        nautilus_list_base_activate_selection (self->view, ctrl);
++        return GDK_EVENT_STOP;
++    }
++
++    /* Find current position */
++    guint current_pos = self->cursor_position;
++    if (current_pos >= total_items)
++    {
++        current_pos = get_first_selected_position (self);
++        if (current_pos >= total_items)
++        {
++            current_pos = 0;
++        }
++    }
++
++    guint cur_row = 0;
++    guint cur_col = 0;
++    nautilus_grid_row_model_get_coords (self->row_model, current_pos, &cur_row, &cur_col);
++    guint total_rows = nautilus_grid_row_model_get_n_rows (self->row_model);
++
++    gint target_pos = -1;
++
++    switch (keyval)
++    {
++        case GDK_KEY_Left:
++        case GDK_KEY_KP_Left:
++        {
++            if (current_pos > 0)
++            {
++                target_pos = current_pos - 1;
++            }
++            else
++            {
++                target_pos = 0;
++            }
++        }
++        break;
++
++        case GDK_KEY_Right:
++        case GDK_KEY_KP_Right:
++        {
++            if (current_pos + 1 < total_items)
++            {
++                target_pos = current_pos + 1;
++            }
++            else
++            {
++                target_pos = total_items - 1;
++            }
++        }
++        break;
++
++        case GDK_KEY_Up:
++        case GDK_KEY_KP_Up:
++        {
++            if (cur_row > 0)
++            {
++                target_pos = nautilus_grid_row_model_get_position_at (self->row_model, cur_row - 1, cur_col);
++            }
++            else
++            {
++                target_pos = current_pos;
++            }
++        }
++        break;
++
++        case GDK_KEY_Down:
++        case GDK_KEY_KP_Down:
++        {
++            if (cur_row + 1 < total_rows)
++            {
++                target_pos = nautilus_grid_row_model_get_position_at (self->row_model, cur_row + 1, cur_col);
++            }
++            else
++            {
++                target_pos = current_pos;
++            }
++        }
++        break;
++
++        case GDK_KEY_Page_Up:
++        case GDK_KEY_KP_Page_Up:
++        case GDK_KEY_Page_Down:
++        case GDK_KEY_KP_Page_Down:
++        {
++            GtkWidget *slot = g_hash_table_lookup (self->bound_slots, GUINT_TO_POINTER (current_pos));
++            guint row_height = slot != NULL ? (guint) gtk_widget_get_height (slot) : get_icon_size_for_zoom_level (self->zoom_level) + 64;
++            guint page_rows = MAX (1, gtk_widget_get_height (GTK_WIDGET (self->grouped_view_ui)) / MAX (1, row_height + 6));
++            gboolean up = keyval == GDK_KEY_Page_Up || keyval == GDK_KEY_KP_Page_Up;
++            guint target_row = up ? cur_row - MIN (cur_row, page_rows) : MIN (total_rows - 1, cur_row + page_rows);
++
++            target_pos = nautilus_grid_row_model_get_position_at (self->row_model, target_row, cur_col);
++        }
++        break;
++
++        case GDK_KEY_Home:
++        case GDK_KEY_KP_Home:
++        {
++            target_pos = 0;
++        }
++        break;
++
++        case GDK_KEY_End:
++        case GDK_KEY_KP_End:
++        {
++            target_pos = total_items - 1;
++        }
++        break;
++
++        case GDK_KEY_space:
++        case GDK_KEY_KP_Space:
++        {
++            if (ctrl)
++            {
++                gboolean sel = gtk_selection_model_is_selected (GTK_SELECTION_MODEL (model), current_pos);
++                if (sel)
++                {
++                    gtk_selection_model_unselect_item (GTK_SELECTION_MODEL (model), current_pos);
++                }
++                else
++                {
++                    gtk_selection_model_select_item (GTK_SELECTION_MODEL (model), current_pos, FALSE);
++                }
++                return GDK_EVENT_STOP;
++            }
++        }
++        break;
++
++        default:
++            return GDK_EVENT_PROPAGATE;
++    }
++
++    if (target_pos >= 0 && (guint) target_pos < total_items)
++    {
++        guint pos = (guint) target_pos;
++        guint saved_anchor = self->anchor_position;
++
++        if (shift)
++        {
++            guint anchor = (self->anchor_position < total_items) ? self->anchor_position : current_pos;
++            guint start = MIN (anchor, pos);
++            guint n = ABS ((gint) pos - (gint) anchor) + 1;
++            gtk_selection_model_select_range (GTK_SELECTION_MODEL (model), start, n, !ctrl);
++        }
++        else if (!ctrl)
++        {
++            gtk_selection_model_select_item (GTK_SELECTION_MODEL (model), pos, TRUE);
++            self->anchor_position = pos;
++        }
++        else
++        {
++            self->anchor_position = pos;
++        }
++
++        nautilus_grouped_grid_scroll_to (self, pos, GTK_LIST_SCROLL_FOCUS, NULL);
++        if (shift)
++        {
++            self->anchor_position = saved_anchor < total_items ? saved_anchor : current_pos;
++        }
++        return GDK_EVENT_STOP;
++    }
++
++    return GDK_EVENT_PROPAGATE;
++}
++
++static gboolean
++on_grouped_view_key_pressed (GtkEventControllerKey *controller,
++                             guint                  keyval,
++                             guint                  keycode,
++                             GdkModifierType        state,
++                             gpointer               user_data)
++{
++    NautilusGroupedGrid *self = NAUTILUS_GROUPED_GRID (user_data);
++
++    return grouped_grid_handle_key (self, keyval, state);
++}
++
++static void
++update_slot_selection (GtkWidget *slot,
++                       gboolean   selected)
++{
++    if (selected)
++    {
++        gtk_widget_set_state_flags (slot, GTK_STATE_FLAG_SELECTED, FALSE);
++        gtk_widget_add_css_class (slot, "selected");
++    }
++    else
++    {
++        gtk_widget_unset_state_flags (slot, GTK_STATE_FLAG_SELECTED);
++        gtk_widget_remove_css_class (slot, "selected");
++    }
++}
++
++static void
++on_model_selection_changed (GtkSelectionModel *model,
++                            guint              position,
++                            guint              n_items,
++                            gpointer           user_data)
++{
++    NautilusGroupedGrid *self = NAUTILUS_GROUPED_GRID (user_data);
++
++    if (self->bound_slots == NULL)
++    {
++        return;
++    }
++
++    if (n_items == 1)
++    {
++        GtkWidget *slot = g_hash_table_lookup (self->bound_slots, GUINT_TO_POINTER (position));
++        if (slot != NULL)
++        {
++            gboolean sel = gtk_selection_model_is_selected (model, position);
++            update_slot_selection (slot, sel);
++        }
++    }
++    else
++    {
++        GHashTableIter iter;
++        gpointer key, value;
++        g_hash_table_iter_init (&iter, self->bound_slots);
++        while (g_hash_table_iter_next (&iter, &key, &value))
++        {
++            guint pos = GPOINTER_TO_UINT (key);
++            if (pos >= position && pos < position + n_items)
++            {
++                gboolean sel = gtk_selection_model_is_selected (model, pos);
++                update_slot_selection (GTK_WIDGET (value), sel);
++            }
++        }
++    }
++}
++
++static void
++on_model_items_changed (GListModel          *model,
++                        guint                position,
++                        guint                removed,
++                        guint                added,
++                        NautilusGroupedGrid *self)
++{
++    /* Selection follows file identity through a sort; cached indices do not. */
++    self->cursor_position = GTK_INVALID_LIST_POSITION;
++    self->anchor_position = GTK_INVALID_LIST_POSITION;
++    self->defer_unselect_other = FALSE;
++}
++
++static void
++on_cell_click_pressed (GtkGestureClick *gesture,
++                       gint             n_press,
++                       gdouble          x,
++                       gdouble          y,
++                       gpointer         user_data)
++{
++    NautilusGroupedGrid *self = NAUTILUS_GROUPED_GRID (user_data);
++    NautilusGridCell *cell = NAUTILUS_GRID_CELL (gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (gesture)));
++    guint button = gtk_gesture_single_get_current_button (GTK_GESTURE_SINGLE (gesture));
++
++    if (button != GDK_BUTTON_PRIMARY || n_press != 1)
++    {
++        return;
++    }
++
++    guint pos = nautilus_view_cell_get_position (NAUTILUS_VIEW_CELL (cell));
++    if (pos == GTK_INVALID_LIST_POSITION)
++    {
++        return;
++    }
++
++    if (self->view == NULL)
++    {
++        return;
++    }
++
++    NautilusViewModel *model = nautilus_list_base_get_model (self->view);
++    if (model == NULL)
++    {
++        return;
++    }
++
++    GdkModifierType modifiers = gtk_event_controller_get_current_event_state (GTK_EVENT_CONTROLLER (gesture));
++    gboolean ctrl = (modifiers & GDK_CONTROL_MASK) != 0;
++    gboolean shift = (modifiers & GDK_SHIFT_MASK) != 0;
++
++    self->cursor_position = pos;
++    gtk_widget_grab_focus (GTK_WIDGET (self->view));
++
++    if (ctrl && !shift)
++    {
++        gboolean selected = gtk_selection_model_is_selected (GTK_SELECTION_MODEL (model), pos);
++        if (selected)
++        {
++            gtk_selection_model_unselect_item (GTK_SELECTION_MODEL (model), pos);
++        }
++        else
++        {
++            gtk_selection_model_select_item (GTK_SELECTION_MODEL (model), pos, FALSE);
++        }
++        self->anchor_position = pos;
++    }
++    else if (shift)
++    {
++        guint anchor = (self->anchor_position != GTK_INVALID_LIST_POSITION) ? self->anchor_position : pos;
++        guint start = MIN (anchor, pos);
++        guint n = ABS ((gint) pos - (gint) anchor) + 1;
++        gtk_selection_model_select_range (GTK_SELECTION_MODEL (model), start, n, !ctrl);
++    }
++    else
++    {
++        gboolean selected = gtk_selection_model_is_selected (GTK_SELECTION_MODEL (model), pos);
++        if (!selected)
++        {
++            gtk_selection_model_select_item (GTK_SELECTION_MODEL (model), pos, TRUE);
++            self->anchor_position = pos;
++        }
++        else
++        {
++            self->defer_unselect_other = TRUE;
++            self->defer_unselect_pos = pos;
++        }
++    }
++}
++
++static void
++on_cell_click_released (GtkGestureClick *gesture,
++                        gint             n_press,
++                        gdouble          x,
++                        gdouble          y,
++                        gpointer         user_data)
++{
++    NautilusGroupedGrid *self = NAUTILUS_GROUPED_GRID (user_data);
++    NautilusGridCell *cell = NAUTILUS_GRID_CELL (gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (gesture)));
++    guint button = gtk_gesture_single_get_current_button (GTK_GESTURE_SINGLE (gesture));
++
++    if (button == GDK_BUTTON_PRIMARY && self->defer_unselect_other)
++    {
++        guint pos = nautilus_view_cell_get_position (NAUTILUS_VIEW_CELL (cell));
++        if (pos == self->defer_unselect_pos && self->view != NULL)
++        {
++            NautilusViewModel *model = nautilus_list_base_get_model (self->view);
++            if (model != NULL)
++            {
++                gtk_selection_model_select_item (GTK_SELECTION_MODEL (model), pos, TRUE);
++                self->anchor_position = pos;
++                self->cursor_position = pos;
++            }
++        }
++        self->defer_unselect_other = FALSE;
++    }
++}
++
++static void
++on_cell_click_stopped (GtkGestureClick *gesture,
++                       gpointer         user_data)
++{
++    NautilusGroupedGrid *self = NAUTILUS_GROUPED_GRID (user_data);
++
++    self->defer_unselect_other = FALSE;
++}
++
++static GtkWidget *
++create_slot (NautilusGroupedGrid *self)
++{
++    GtkWidget *slot = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
++    gtk_widget_add_css_class (slot, "grouped-grid-cell");
++    gtk_widget_set_halign (slot, GTK_ALIGN_CENTER);
++    gtk_widget_set_valign (slot, GTK_ALIGN_START);
++
++    NautilusGridCell *cell = nautilus_grid_cell_new (self->view);
++    setup_cell_gestures (NAUTILUS_VIEW_CELL (cell));
++    setup_cell_hover (NAUTILUS_VIEW_CELL (cell));
++
++    if (self->view != NULL)
++    {
++        g_object_bind_property (self->view, "icon-size",
++                                cell, "icon-size",
++                                G_BINDING_SYNC_CREATE);
++    }
++
++    nautilus_grid_cell_set_caption_attributes (cell, self->caption_attributes);
++
++    GtkEventController *click = GTK_EVENT_CONTROLLER (gtk_gesture_click_new ());
++    gtk_widget_add_controller (GTK_WIDGET (cell), click);
++    gtk_event_controller_set_propagation_phase (click, GTK_PHASE_BUBBLE);
++    gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), GDK_BUTTON_PRIMARY);
++    g_signal_connect_object (click, "pressed", G_CALLBACK (on_cell_click_pressed), self, 0);
++    g_signal_connect_object (click, "released", G_CALLBACK (on_cell_click_released), self, 0);
++    g_signal_connect_object (click, "stopped", G_CALLBACK (on_cell_click_stopped), self, 0);
++
++    gtk_box_append (GTK_BOX (slot), GTK_WIDGET (cell));
++
++    return slot;
++}
++
++static void
++setup_row_item (GtkSignalListItemFactory *factory,
++                GtkListItem              *listitem,
++                gpointer                  user_data)
++{
++    GtkWidget *container = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
++    GtkWidget *row_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
++
++    gtk_box_set_homogeneous (GTK_BOX (row_box), TRUE);
++    gtk_widget_add_css_class (row_box, "grouped-grid-row");
++    /* Include the heading in its first layout row so scrolling to that row
++     * also reveals its heading, rather than anchoring below a separate header. */
++    gtk_box_append (GTK_BOX (container), row_box);
++    gtk_list_item_set_child (listitem, container);
++    gtk_list_item_set_activatable (listitem, FALSE);
++    gtk_list_item_set_selectable (listitem, FALSE);
++    gtk_list_item_set_focusable (listitem, FALSE);
++}
++
++static void
++bind_row_item (GtkSignalListItemFactory *factory,
++               GtkListItem              *listitem,
++               gpointer                  user_data)
++{
++    NautilusGroupedGrid *self = NAUTILUS_GROUPED_GRID (user_data);
++
++    if (self->view == NULL)
++    {
++        return;
++    }
++
++    NautilusViewModel *model = nautilus_list_base_get_model (self->view);
++    NautilusGridRow *row = NAUTILUS_GRID_ROW (gtk_list_item_get_item (listitem));
++    GtkWidget *container = gtk_list_item_get_child (listitem);
++    GtkWidget *row_box = container != NULL ? gtk_widget_get_last_child (container) : NULL;
++
++    if (row == NULL || model == NULL || row_box == NULL)
++    {
++        return;
++    }
++
++    gboolean starts_section = nautilus_grid_row_get_starts_section (row);
++    guint start_index = nautilus_grid_row_get_start_index (row);
++    guint n_items = nautilus_grid_row_get_n_items (row);
++
++    GtkWidget *header = gtk_widget_get_first_child (container);
++    if (starts_section && header == row_box)
++    {
++        header = nautilus_list_base_create_group_header_widget ();
++        gtk_box_prepend (GTK_BOX (container), header);
++    }
++    if (header != row_box)
++    {
++        gtk_widget_set_visible (header, starts_section);
++        if (starts_section)
++        {
++            g_autoptr (GtkTreeListRow) first = nautilus_grid_row_get_first_row (row);
++            gboolean is_first_section = (start_index == 0);
++
++            nautilus_list_base_bind_group_header_widget (header, self->view, first, is_first_section);
++        }
++        else
++        {
++            nautilus_list_base_unbind_group_header_widget (header);
++        }
++    }
++
++    guint n_children = 0;
++    for (GtkWidget *child = gtk_widget_get_first_child (row_box);
++         child != NULL;
++         child = gtk_widget_get_next_sibling (child))
++    {
++        n_children++;
++    }
++
++    while (n_children < self->n_columns)
++    {
++        GtkWidget *slot = create_slot (self);
++        gtk_box_append (GTK_BOX (row_box), slot);
++        n_children++;
++    }
++
++    guint col = 0;
++    for (GtkWidget *slot = gtk_widget_get_first_child (row_box);
++         slot != NULL;
++         slot = gtk_widget_get_next_sibling (slot), col++)
++    {
++        GtkWidget *cell = gtk_widget_get_first_child (slot);
++
++        if (col < n_items)
++        {
++            guint global_pos = start_index + col;
++            g_autoptr (GtkTreeListRow) tree_row = g_list_model_get_item (G_LIST_MODEL (model), global_pos);
++
++            if (tree_row != NULL)
++            {
++                g_autoptr (NautilusViewItem) view_item = NAUTILUS_VIEW_ITEM (gtk_tree_list_row_get_item (tree_row));
++
++                if (view_item != NULL)
++                {
++                    nautilus_view_cell_set_item (NAUTILUS_VIEW_CELL (cell), view_item);
++                    g_object_set (cell, "position", global_pos, NULL);
++                    nautilus_view_item_set_item_ui (view_item, cell);
++
++                    NautilusFile *file = nautilus_view_item_get_file (view_item);
++                    if (file != NULL)
++                    {
++                        gtk_accessible_update_property (GTK_ACCESSIBLE (slot),
++                                                        GTK_ACCESSIBLE_PROPERTY_LABEL,
++                                                        nautilus_file_get_display_name (file),
++                                                        -1);
++                    }
++                }
++            }
++
++            gboolean is_selected = gtk_selection_model_is_selected (GTK_SELECTION_MODEL (model), global_pos);
++            update_slot_selection (slot, is_selected);
++            gtk_widget_set_visible (cell, TRUE);
++            gtk_widget_set_visible (slot, TRUE);
++
++            g_hash_table_insert (self->bound_slots, GUINT_TO_POINTER (global_pos), slot);
++        }
++        else if (col < self->n_columns)
++        {
++            gtk_widget_set_visible (cell, FALSE);
++            update_slot_selection (slot, FALSE);
++            gtk_widget_set_visible (slot, TRUE);
++        }
++        else
++        {
++            gtk_widget_set_visible (cell, FALSE);
++            update_slot_selection (slot, FALSE);
++            gtk_widget_set_visible (slot, FALSE);
++        }
++    }
++}
++
++static void
++unbind_row_item (GtkSignalListItemFactory *factory,
++                 GtkListItem              *listitem,
++                 gpointer                  user_data)
++{
++    NautilusGroupedGrid *self = NAUTILUS_GROUPED_GRID (user_data);
++    GtkWidget *container = gtk_list_item_get_child (listitem);
++    GtkWidget *row_box = container != NULL ? gtk_widget_get_last_child (container) : NULL;
++
++    if (row_box == NULL)
++    {
++        return;
++    }
++
++    GtkWidget *header = gtk_widget_get_first_child (container);
++    if (header != row_box)
++    {
++        nautilus_list_base_unbind_group_header_widget (header);
++    }
++
++    for (GtkWidget *slot = gtk_widget_get_first_child (row_box);
++         slot != NULL;
++         slot = gtk_widget_get_next_sibling (slot))
++    {
++        GtkWidget *cell = gtk_widget_get_first_child (slot);
++        if (cell != NULL)
++        {
++            guint pos = nautilus_view_cell_get_position (NAUTILUS_VIEW_CELL (cell));
++            if (pos != GTK_INVALID_LIST_POSITION && self->bound_slots != NULL &&
++                g_hash_table_lookup (self->bound_slots, GUINT_TO_POINTER (pos)) == slot)
++            {
++                g_hash_table_remove (self->bound_slots, GUINT_TO_POINTER (pos));
++            }
++
++            g_autoptr (NautilusViewItem) item = nautilus_view_cell_get_item (NAUTILUS_VIEW_CELL (cell));
++            if (item != NULL)
++            {
++                if (nautilus_view_item_get_item_ui (item) == cell)
++                {
++                    nautilus_view_item_set_item_ui (item, NULL);
++                }
++                nautilus_view_cell_set_item (NAUTILUS_VIEW_CELL (cell), NULL);
++            }
++            g_object_set (cell, "position", GTK_INVALID_LIST_POSITION, NULL);
++            update_slot_selection (slot, FALSE);
++        }
++    }
++}
++
++/* --- Rubberband Callbacks --- */
++
++static void
++on_drag_begin (GtkGestureDrag *gesture,
++               gdouble         start_x,
++               gdouble         start_y,
++               gpointer        user_data)
++{
++    NautilusGroupedGrid *self = NAUTILUS_GROUPED_GRID (user_data);
++
++    if (!self->rubberband_enabled || self->view == NULL)
++    {
++        gtk_gesture_set_state (GTK_GESTURE (gesture), GTK_EVENT_SEQUENCE_DENIED);
++        return;
++    }
++
++    self->drag_start_x = start_x;
++    self->drag_start_y = start_y;
++
++    NautilusViewModel *model = nautilus_list_base_get_model (self->view);
++    if (model == NULL)
++    {
++        return;
++    }
++
++    GdkModifierType modifiers = gtk_event_controller_get_current_event_state (GTK_EVENT_CONTROLLER (gesture));
++    gboolean selection_mode = (modifiers & (GDK_CONTROL_MASK | GDK_SHIFT_MASK)) != 0;
++
++    g_clear_pointer (&self->drag_initial_selection, gtk_bitset_unref);
++    g_clear_pointer (&self->drag_work_selection, gtk_bitset_unref);
++    g_clear_pointer (&self->drag_mask, gtk_bitset_unref);
++    self->drag_initial_selection = selection_mode
++                                   ? gtk_selection_model_get_selection (GTK_SELECTION_MODEL (model))
++                                   : gtk_bitset_new_empty ();
++    self->drag_work_selection = gtk_bitset_new_empty ();
++    self->drag_mask = gtk_bitset_new_range (0, g_list_model_get_n_items (G_LIST_MODEL (model)));
++    self->drag_toggle = (modifiers & GDK_CONTROL_MASK) != 0;
++
++    if (!selection_mode)
++    {
++        gtk_selection_model_unselect_all (GTK_SELECTION_MODEL (model));
++    }
++}
++
++static void
++on_drag_update (GtkGestureDrag *gesture,
++                gdouble         offset_x,
++                gdouble         offset_y,
++                gpointer        user_data)
++{
++    NautilusGroupedGrid *self = NAUTILUS_GROUPED_GRID (user_data);
++
++    if (!self->rubberband_enabled || self->grouped_view_ui == NULL || self->view == NULL)
++    {
++        return;
++    }
++
++    NautilusViewModel *model = nautilus_list_base_get_model (self->view);
++    if (model == NULL || self->bound_slots == NULL || self->drag_initial_selection == NULL)
++    {
++        return;
++    }
++
++    double rx = MIN (self->drag_start_x, self->drag_start_x + offset_x);
++    double ry = MIN (self->drag_start_y, self->drag_start_y + offset_y);
++    double rw = ABS (offset_x);
++    double rh = ABS (offset_y);
++    graphene_rect_t rub_rect = GRAPHENE_RECT_INIT ((float) rx, (float) ry, (float) rw, (float) rh);
++
++    if (self->rubberband_widget != NULL)
++    {
++        graphene_point_t p1, p2;
++        if (gtk_widget_compute_point (GTK_WIDGET (self->grouped_view_ui),
++                                      GTK_WIDGET (self->view),
++                                      &GRAPHENE_POINT_INIT ((float) self->drag_start_x, (float) self->drag_start_y),
++                                      &p1) &&
++            gtk_widget_compute_point (GTK_WIDGET (self->grouped_view_ui),
++                                      GTK_WIDGET (self->view),
++                                      &GRAPHENE_POINT_INIT ((float) (self->drag_start_x + offset_x), (float) (self->drag_start_y + offset_y)),
++                                      &p2))
++        {
++            float ox = MIN (p1.x, p2.x);
++            float oy = MIN (p1.y, p2.y);
++            float ow = ABS (p2.x - p1.x);
++            float oh = ABS (p2.y - p1.y);
++
++            gtk_widget_set_margin_start (self->rubberband_widget, (int) ox);
++            gtk_widget_set_margin_top (self->rubberband_widget, (int) oy);
++            gtk_widget_set_size_request (self->rubberband_widget, (int) ow, (int) oh);
++            gtk_widget_set_visible (self->rubberband_widget, TRUE);
++        }
++    }
++
++    gtk_bitset_remove_all (self->drag_work_selection);
++    gtk_bitset_union (self->drag_work_selection, self->drag_initial_selection);
++
++    GHashTableIter iter;
++    gpointer key, value;
++    g_hash_table_iter_init (&iter, self->bound_slots);
++    while (g_hash_table_iter_next (&iter, &key, &value))
++    {
++        guint pos = GPOINTER_TO_UINT (key);
++        GtkWidget *slot = GTK_WIDGET (value);
++
++        graphene_point_t p;
++        if (gtk_widget_compute_point (slot, GTK_WIDGET (self->grouped_view_ui),
++                                      &GRAPHENE_POINT_INIT (0, 0), &p))
++        {
++            graphene_rect_t cell_rect = GRAPHENE_RECT_INIT (p.x, p.y,
++                                                           (float) gtk_widget_get_width (slot),
++                                                           (float) gtk_widget_get_height (slot));
++
++            if (graphene_rect_intersection (&rub_rect, &cell_rect, NULL))
++            {
++                if (self->drag_toggle && gtk_bitset_contains (self->drag_initial_selection, pos))
++                {
++                    gtk_bitset_remove (self->drag_work_selection, pos);
++                }
++                else
++                {
++                    gtk_bitset_add (self->drag_work_selection, pos);
++                }
++            }
++        }
++    }
++    gtk_selection_model_set_selection (GTK_SELECTION_MODEL (model), self->drag_work_selection, self->drag_mask);
++}
++
++static void
++on_drag_end (GtkGestureDrag *gesture,
++             gdouble         offset_x,
++             gdouble         offset_y,
++             gpointer        user_data)
++{
++    NautilusGroupedGrid *self = NAUTILUS_GROUPED_GRID (user_data);
++
++    g_clear_pointer (&self->drag_initial_selection, gtk_bitset_unref);
++    g_clear_pointer (&self->drag_work_selection, gtk_bitset_unref);
++    g_clear_pointer (&self->drag_mask, gtk_bitset_unref);
++
++    if (self->rubberband_widget != NULL)
++    {
++        gtk_widget_set_visible (self->rubberband_widget, FALSE);
++    }
++}
++
++static GtkListView *
++create_grouped_view_ui (NautilusGroupedGrid *self)
++{
++    g_autoptr (GtkListItemFactory) row_factory = NULL;
++    g_autoptr (GtkNoSelection) no_selection = NULL;
++    GtkWidget *widget;
++
++    self->row_model = nautilus_grid_row_model_new ();
++    no_selection = gtk_no_selection_new (G_LIST_MODEL (g_object_ref (self->row_model)));
++
++    row_factory = gtk_signal_list_item_factory_new ();
++    g_signal_connect_object (row_factory, "setup", G_CALLBACK (setup_row_item), self, 0);
++    g_signal_connect_object (row_factory, "bind", G_CALLBACK (bind_row_item), self, 0);
++    g_signal_connect_object (row_factory, "unbind", G_CALLBACK (unbind_row_item), self, 0);
++
++    widget = gtk_list_view_new (GTK_SELECTION_MODEL (g_steal_pointer (&no_selection)),
++                                g_steal_pointer (&row_factory));
++    gtk_list_view_set_single_click_activate (GTK_LIST_VIEW (widget), FALSE);
++    gtk_list_view_set_tab_behavior (GTK_LIST_VIEW (widget), GTK_LIST_TAB_ITEM);
++    gtk_widget_set_focusable (widget, FALSE);
++
++    gtk_accessible_update_property (GTK_ACCESSIBLE (widget),
++                                    GTK_ACCESSIBLE_PROPERTY_LABEL,
++                                    _("Content View"),
++                                    GTK_ACCESSIBLE_PROPERTY_ROLE_DESCRIPTION,
++                                    _("View of the current location"),
++                                    -1);
++
++    self->drag_gesture = g_object_ref (GTK_GESTURE_DRAG (gtk_gesture_drag_new ()));
++    gtk_widget_add_controller (widget, GTK_EVENT_CONTROLLER (self->drag_gesture));
++    gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (self->drag_gesture), GTK_PHASE_BUBBLE);
++    gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (self->drag_gesture), GDK_BUTTON_PRIMARY);
++    g_signal_connect_object (self->drag_gesture, "drag-begin", G_CALLBACK (on_drag_begin), self, 0);
++    g_signal_connect_object (self->drag_gesture, "drag-update", G_CALLBACK (on_drag_update), self, 0);
++    g_signal_connect_object (self->drag_gesture, "drag-end", G_CALLBACK (on_drag_end), self, 0);
++
++    return GTK_LIST_VIEW (widget);
++}
++
++static void
++nautilus_grouped_grid_dispose (GObject *object)
++{
++    NautilusGroupedGrid *self = NAUTILUS_GROUPED_GRID (object);
++
++    if (self->key_controller != NULL)
++    {
++        if (self->view != NULL)
++        {
++            gtk_widget_remove_controller (GTK_WIDGET (self->view), self->key_controller);
++        }
++        g_clear_object (&self->key_controller);
++    }
++
++    if (self->drag_gesture != NULL)
++    {
++        if (self->grouped_view_ui != NULL)
++        {
++            gtk_widget_remove_controller (GTK_WIDGET (self->grouped_view_ui),
++                                          GTK_EVENT_CONTROLLER (self->drag_gesture));
++        }
++        g_clear_object (&self->drag_gesture);
++    }
++
++    if (self->rubberband_widget != NULL)
++    {
++        GtkWidget *rubberband = self->rubberband_widget;
++        g_clear_weak_pointer (&self->rubberband_widget);
++        GtkWidget *parent = gtk_widget_get_parent (rubberband);
++        if (GTK_IS_OVERLAY (parent))
++        {
++            gtk_overlay_remove_overlay (GTK_OVERLAY (parent), rubberband);
++        }
++    }
++
++    if (self->connected_model != NULL)
++    {
++        g_signal_handlers_disconnect_by_data (self->connected_model, self);
++        g_clear_object (&self->connected_model);
++    }
++
++    g_clear_pointer (&self->drag_initial_selection, gtk_bitset_unref);
++    g_clear_pointer (&self->drag_work_selection, gtk_bitset_unref);
++    g_clear_pointer (&self->drag_mask, gtk_bitset_unref);
++
++    if (self->grouped_view_ui != NULL)
++    {
++        GtkWidget *parent = gtk_widget_get_parent (GTK_WIDGET (self->grouped_view_ui));
++
++        gtk_list_view_set_model (self->grouped_view_ui, NULL);
++        if (GTK_IS_SCROLLED_WINDOW (parent))
++        {
++            gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (parent), NULL);
++        }
++    }
++
++    if (self->bound_slots != NULL)
++    {
++        g_hash_table_destroy (self->bound_slots);
++        self->bound_slots = NULL;
++    }
++
++    g_clear_object (&self->row_model);
++    g_clear_object (&self->grouped_view_ui);
++
++    if (self->view != NULL)
++    {
++        g_object_remove_weak_pointer (G_OBJECT (self->view), (gpointer *) &self->view);
++        self->view = NULL;
++    }
++
++    G_OBJECT_CLASS (nautilus_grouped_grid_parent_class)->dispose (object);
++}
++
++static void
++nautilus_grouped_grid_class_init (NautilusGroupedGridClass *klass)
++{
++    GObjectClass *object_class = G_OBJECT_CLASS (klass);
++
++    object_class->dispose = nautilus_grouped_grid_dispose;
++}
++
++static void
++nautilus_grouped_grid_init (NautilusGroupedGrid *self)
++{
++    self->bound_slots = g_hash_table_new (g_direct_hash, g_direct_equal);
++    self->anchor_position = GTK_INVALID_LIST_POSITION;
++    self->cursor_position = GTK_INVALID_LIST_POSITION;
++    self->n_columns = 4;
++}
++
++NautilusGroupedGrid *
++nautilus_grouped_grid_new (NautilusListBase *view)
++{
++    g_return_val_if_fail (NAUTILUS_IS_LIST_BASE (view), NULL);
++
++    NautilusGroupedGrid *self = g_object_new (NAUTILUS_TYPE_GROUPED_GRID, NULL);
++
++    self->view = view;
++    g_object_add_weak_pointer (G_OBJECT (view), (gpointer *) &self->view);
++
++    self->grouped_view_ui = g_object_ref_sink (create_grouped_view_ui (self));
++
++    GtkWidget *rubberband = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
++    gtk_widget_add_css_class (rubberband, "rubberband");
++    gtk_widget_set_can_target (rubberband, FALSE);
++    gtk_widget_set_can_focus (rubberband, FALSE);
++    gtk_widget_set_halign (rubberband, GTK_ALIGN_START);
++    gtk_widget_set_valign (rubberband, GTK_ALIGN_START);
++    gtk_widget_set_visible (rubberband, FALSE);
++    g_set_weak_pointer (&self->rubberband_widget, rubberband);
++    nautilus_list_base_add_overlay (view, rubberband);
++
++    self->key_controller = g_object_ref (gtk_event_controller_key_new ());
++    gtk_widget_add_controller (GTK_WIDGET (view), self->key_controller);
++    gtk_event_controller_set_propagation_phase (self->key_controller, GTK_PHASE_CAPTURE);
++    g_signal_connect_object (self->key_controller, "key-pressed",
++                             G_CALLBACK (on_grouped_view_key_pressed), self, 0);
++
++    return self;
++}
++
++GtkWidget *
++nautilus_grouped_grid_get_widget (NautilusGroupedGrid *self)
++{
++    g_return_val_if_fail (NAUTILUS_IS_GROUPED_GRID (self), NULL);
++
++    return GTK_WIDGET (self->grouped_view_ui);
++}
++
++void
++nautilus_grouped_grid_set_model (NautilusGroupedGrid *self,
++                                 NautilusViewModel   *model)
++{
++    g_return_if_fail (NAUTILUS_IS_GROUPED_GRID (self));
++
++    if (self->connected_model != NULL)
++    {
++        g_signal_handlers_disconnect_by_data (self->connected_model, self);
++        g_clear_object (&self->connected_model);
++    }
++
++    if (model != NULL)
++    {
++        self->connected_model = g_object_ref (model);
++        g_signal_connect_object (model, "selection-changed",
++                                 G_CALLBACK (on_model_selection_changed), self, 0);
++        g_signal_connect_object (model, "items-changed",
++                                 G_CALLBACK (on_model_items_changed), self, 0);
++    }
++
++    self->anchor_position = GTK_INVALID_LIST_POSITION;
++    self->cursor_position = GTK_INVALID_LIST_POSITION;
++    self->defer_unselect_other = FALSE;
++
++    if (self->row_model != NULL)
++    {
++        nautilus_grid_row_model_set_base_model (self->row_model, model);
++    }
++}
++
++void
++nautilus_grouped_grid_set_n_columns (NautilusGroupedGrid *self,
++                                     guint                n_columns)
++{
++    g_return_if_fail (NAUTILUS_IS_GROUPED_GRID (self));
++
++    if (self->n_columns == n_columns || n_columns == 0)
++    {
++        return;
++    }
++
++    self->n_columns = n_columns;
++    if (self->row_model != NULL)
++    {
++        nautilus_grid_row_model_set_n_columns (self->row_model, self->n_columns);
++    }
++}
++
++void
++nautilus_grouped_grid_set_zoom_level (NautilusGroupedGrid   *self,
++                                      NautilusGridZoomLevel  zoom_level)
++{
++    g_return_if_fail (NAUTILUS_IS_GROUPED_GRID (self));
++
++    self->zoom_level = zoom_level;
++}
++
++void
++nautilus_grouped_grid_set_caption_attributes (NautilusGroupedGrid *self,
++                                              const GQuark         attrs[NAUTILUS_GRID_CELL_N_CAPTIONS])
++{
++    g_return_if_fail (NAUTILUS_IS_GROUPED_GRID (self));
++
++    if (attrs != NULL)
++    {
++        memcpy (self->caption_attributes, attrs, sizeof (self->caption_attributes));
++    }
++    else
++    {
++        memset (self->caption_attributes, 0, sizeof (self->caption_attributes));
++    }
++
++    if (self->bound_slots != NULL)
++    {
++        GHashTableIter iter;
++        gpointer key, value;
++        g_hash_table_iter_init (&iter, self->bound_slots);
++        while (g_hash_table_iter_next (&iter, &key, &value))
++        {
++            GtkWidget *slot = GTK_WIDGET (value);
++            GtkWidget *cell = gtk_widget_get_first_child (slot);
++            if (cell != NULL && NAUTILUS_IS_GRID_CELL (cell))
++            {
++                nautilus_grid_cell_set_caption_attributes (NAUTILUS_GRID_CELL (cell),
++                                                           self->caption_attributes);
++            }
++        }
++    }
++}
++
++void
++nautilus_grouped_grid_set_enable_rubberband (NautilusGroupedGrid *self,
++                                             gboolean             enabled)
++{
++    g_return_if_fail (NAUTILUS_IS_GROUPED_GRID (self));
++
++    self->rubberband_enabled = enabled;
++}
++
++gboolean
++nautilus_grouped_grid_scroll_to (NautilusGroupedGrid *self,
++                                 guint                position,
++                                 GtkListScrollFlags   flags,
++                                 GtkScrollInfo       *scroll)
++{
++    g_return_val_if_fail (NAUTILUS_IS_GROUPED_GRID (self), FALSE);
++
++    guint row = 0;
++    if (self->row_model != NULL &&
++        nautilus_grid_row_model_get_coords (self->row_model, position, &row, NULL))
++    {
++        if (flags & GTK_LIST_SCROLL_SELECT && self->view != NULL)
++        {
++            NautilusViewModel *model = nautilus_list_base_get_model (self->view);
++            if (model != NULL)
++            {
++                gtk_selection_model_select_item (GTK_SELECTION_MODEL (model), position, TRUE);
++            }
++        }
++        if (flags & GTK_LIST_SCROLL_FOCUS && self->view != NULL)
++        {
++            self->cursor_position = position;
++            self->anchor_position = position;
++            gtk_widget_grab_focus (GTK_WIDGET (self->view));
++        }
++        /* Virtual rows are layout units, not keyboard-selectable files. */
++        gtk_list_view_scroll_to (self->grouped_view_ui, row, GTK_LIST_SCROLL_NONE, scroll);
++        return TRUE;
++    }
++
++    return FALSE;
++}
++
++void
++nautilus_grouped_grid_preview_selection_event (NautilusGroupedGrid *self,
++                                               GtkDirectionType     direction)
++{
++    g_return_if_fail (NAUTILUS_IS_GROUPED_GRID (self));
++
++    guint keyval;
++    switch (direction)
++    {
++        case GTK_DIR_UP:
++        {
++            keyval = GDK_KEY_Up;
++        }
++        break;
++
++        case GTK_DIR_DOWN:
++        {
++            keyval = GDK_KEY_Down;
++        }
++        break;
++
++        case GTK_DIR_LEFT:
++        {
++            keyval = GDK_KEY_Left;
++        }
++        break;
++
++        case GTK_DIR_RIGHT:
++        {
++            keyval = GDK_KEY_Right;
++        }
++        break;
++
++        default:
++        {
++            return;
++        }
++    }
++
++    grouped_grid_handle_key (self, keyval, 0);
++}
+diff --git a/src/nautilus-grouped-grid.h b/src/nautilus-grouped-grid.h
+new file mode 100644
+index 0000000..16eae82
+--- /dev/null
++++ b/src/nautilus-grouped-grid.h
+@@ -0,0 +1,40 @@
++/*
++ * Copyright (C) 2022 The GNOME project contributors
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#pragma once
++
++#include "nautilus-enums.h"
++#include "nautilus-grid-cell.h"
++#include "nautilus-list-base.h"
++#include "nautilus-view-model.h"
++
++#include <gtk/gtk.h>
++
++G_BEGIN_DECLS
++
++#define NAUTILUS_TYPE_GROUPED_GRID (nautilus_grouped_grid_get_type ())
++G_DECLARE_FINAL_TYPE (NautilusGroupedGrid, nautilus_grouped_grid, NAUTILUS, GROUPED_GRID, GObject)
++
++NautilusGroupedGrid *nautilus_grouped_grid_new                     (NautilusListBase      *view);
++GtkWidget           *nautilus_grouped_grid_get_widget              (NautilusGroupedGrid   *self);
++void                 nautilus_grouped_grid_set_model               (NautilusGroupedGrid   *self,
++                                                                    NautilusViewModel     *model);
++void                 nautilus_grouped_grid_set_n_columns           (NautilusGroupedGrid   *self,
++                                                                    guint                  n_columns);
++void                 nautilus_grouped_grid_set_zoom_level          (NautilusGroupedGrid   *self,
++                                                                    NautilusGridZoomLevel  zoom_level);
++void                 nautilus_grouped_grid_set_caption_attributes  (NautilusGroupedGrid   *self,
++                                                                    const GQuark           attrs[NAUTILUS_GRID_CELL_N_CAPTIONS]);
++void                 nautilus_grouped_grid_set_enable_rubberband   (NautilusGroupedGrid   *self,
++                                                                    gboolean               enabled);
++gboolean             nautilus_grouped_grid_scroll_to               (NautilusGroupedGrid   *self,
++                                                                    guint                  position,
++                                                                    GtkListScrollFlags     flags,
++                                                                    GtkScrollInfo         *scroll);
++void                 nautilus_grouped_grid_preview_selection_event (NautilusGroupedGrid   *self,
++                                                                    GtkDirectionType       direction);
++
++G_END_DECLS
+diff --git a/test/automated/display/test-files-view.c b/test/automated/display/test-files-view.c
+index 92967c2..e706e63 100644
+--- a/test/automated/display/test-files-view.c
++++ b/test/automated/display/test-files-view.c
+@@ -1423,9 +1423,13 @@ main (int   argc,
+     g_test_add_func ("/view/actions/zoom",
+                      test_zoom_actions);
+     g_test_add_data_func ("/view/grouping/list", GUINT_TO_POINTER (NAUTILUS_VIEW_LIST_ID), test_time_grouping);
++    g_test_add_data_func ("/view/grouping/grid", GUINT_TO_POINTER (NAUTILUS_VIEW_GRID_ID), test_time_grouping);
+     g_test_add_data_func ("/view/grouping/folders/list", GUINT_TO_POINTER (NAUTILUS_VIEW_LIST_ID), test_time_grouping_folders);
++    g_test_add_data_func ("/view/grouping/folders/grid", GUINT_TO_POINTER (NAUTILUS_VIEW_GRID_ID), test_time_grouping_folders);
+     g_test_add_data_func ("/view/grouping/name/list", GUINT_TO_POINTER (NAUTILUS_VIEW_LIST_ID), test_name_grouping);
++    g_test_add_data_func ("/view/grouping/name/grid", GUINT_TO_POINTER (NAUTILUS_VIEW_GRID_ID), test_name_grouping);
+     g_test_add_data_func ("/view/grouping/name/folders/list", GUINT_TO_POINTER (NAUTILUS_VIEW_LIST_ID), test_name_grouping_folders);
++    g_test_add_data_func ("/view/grouping/name/folders/grid", GUINT_TO_POINTER (NAUTILUS_VIEW_GRID_ID), test_name_grouping_folders);
+ 
+     return g_test_run ();
+ }
