@@ -1,28 +1,29 @@
-From ac483ce65ca1936b3612ef83b04ffcac93fd76b3 Mon Sep 17 00:00:00 2001
+From e401d3347eb0e9a123fde4a8ec455b25fb1cd935 Mon Sep 17 00:00:00 2001
 From: Dhanraj <dp914278@gmail.com>
-Date: Wed, 21 Oct 2026 23:27:38 +0530
+Date: Thu, 22 Oct 2026 02:38:22 +0530
 Subject: [PATCH 4/5] Add virtualized grouped icon view
 
-Keep native ungrouped grid setup separate from the grouped controller and row model. Enable grouping for icon views and add their regression coverage without changing source selection semantics.
 ---
- NEWS                                     |    6 +-
- po/POTFILES.in                           |    1 +
- src/meson.build                          |    4 +
- src/nautilus-files-view.c                |    2 +-
- src/nautilus-grid-row-model.c            |  438 ++++++++
- src/nautilus-grid-row-model.h            |   42 +
- src/nautilus-grid-view.c                 |  290 ++++-
- src/nautilus-grouped-grid.c              | 1221 ++++++++++++++++++++++
- src/nautilus-grouped-grid.h              |   40 +
- test/automated/display/test-files-view.c |    4 +
- 10 files changed, 1998 insertions(+), 50 deletions(-)
+ NEWS                             |    6 +-
+ po/POTFILES.in                   |    1 +
+ src/meson.build                  |    4 +
+ src/nautilus-files-view.c        |    2 +-
+ src/nautilus-grid-row-model.c    |  438 +++++++++++
+ src/nautilus-grid-row-model.h    |   42 +
+ src/nautilus-grid-view.c         |  287 +++++--
+ src/nautilus-grouped-grid.c      | 1221 ++++++++++++++++++++++++++++++
+ src/nautilus-grouped-grid.h      |   40 +
+ src/nautilus-list-base-private.h |    2 -
+ src/nautilus-list-base.c         |    6 -
+ test/display/test-files-view.c   |    4 +
+ 12 files changed, 1998 insertions(+), 55 deletions(-)
  create mode 100644 src/nautilus-grid-row-model.c
  create mode 100644 src/nautilus-grid-row-model.h
  create mode 100644 src/nautilus-grouped-grid.c
  create mode 100644 src/nautilus-grouped-grid.h
 
 diff --git a/NEWS b/NEWS
-index 68af020..07597df 100644
+index f91f45755..901b6f9dc 100644
 --- a/NEWS
 +++ b/NEWS
 @@ -1,8 +1,8 @@
@@ -35,13 +36,13 @@ index 68af020..07597df 100644
 +- Separate the virtual icon-row model and grouped rendering/input controller.
 +- Keep folders-first within sections, live header updates, and folder preferences.
  
- Major Changes in 50.1
+ Major Changes in 51.1
  =====================
 diff --git a/po/POTFILES.in b/po/POTFILES.in
-index 88027d5..92c21eb 100644
+index 53d477a3d..619d87eda 100644
 --- a/po/POTFILES.in
 +++ b/po/POTFILES.in
-@@ -41,6 +41,7 @@ src/nautilus-floating-bar.c
+@@ -42,6 +42,7 @@ src/nautilus-floating-bar.c
  src/nautilus-global-preferences.c
  src/nautilus-grid-view.c
  src/nautilus-grid-view-captions-dialog.c
@@ -50,10 +51,10 @@ index 88027d5..92c21eb 100644
  src/nautilus-list-view.c
  src/nautilus-location-banner.c
 diff --git a/src/meson.build b/src/meson.build
-index bad0da5..127da8f 100644
+index d28468664..979d1eadc 100644
 --- a/src/meson.build
 +++ b/src/meson.build
-@@ -118,10 +118,14 @@ libnautilus_sources = [
+@@ -137,10 +137,14 @@ libnautilus_sources = [
    'nautilus-global-preferences.h',
    'nautilus-grid-cell.c',
    'nautilus-grid-cell.h',
@@ -69,10 +70,10 @@ index bad0da5..127da8f 100644
    'nautilus-hash-queue.h',
    'nautilus-history-controls.c',
 diff --git a/src/nautilus-files-view.c b/src/nautilus-files-view.c
-index ef39e4d..f53a6d9 100644
+index 306e1b03e..75126f1a0 100644
 --- a/src/nautilus-files-view.c
 +++ b/src/nautilus-files-view.c
-@@ -616,7 +616,7 @@ supports_grouping (NautilusFilesView *self)
+@@ -611,7 +611,7 @@ supports_grouping (NautilusFilesView *self)
      NautilusFile *file = self->directory_as_file;
  
      return file != NULL &&
@@ -83,7 +84,7 @@ index ef39e4d..f53a6d9 100644
             !nautilus_file_is_in_trash (file) &&
 diff --git a/src/nautilus-grid-row-model.c b/src/nautilus-grid-row-model.c
 new file mode 100644
-index 0000000..7f8f148
+index 000000000..066247a9f
 --- /dev/null
 +++ b/src/nautilus-grid-row-model.c
 @@ -0,0 +1,438 @@
@@ -116,7 +117,7 @@ index 0000000..7f8f148
 +    gboolean starts_section;
 +};
 +
-+G_DEFINE_TYPE (NautilusGridRow, nautilus_grid_row, G_TYPE_OBJECT)
++G_DEFINE_FINAL_TYPE (NautilusGridRow, nautilus_grid_row, G_TYPE_OBJECT)
 +
 +static void
 +nautilus_grid_row_dispose (GObject *object)
@@ -205,7 +206,7 @@ index 0000000..7f8f148
 +static void nautilus_grid_row_model_list_model_init (GListModelInterface *iface);
 +static void nautilus_grid_row_model_section_model_init (GtkSectionModelInterface *iface);
 +
-+G_DEFINE_TYPE_WITH_CODE (NautilusGridRowModel, nautilus_grid_row_model, G_TYPE_OBJECT,
++G_DEFINE_FINAL_TYPE_WITH_CODE (NautilusGridRowModel, nautilus_grid_row_model, G_TYPE_OBJECT,
 +                         G_IMPLEMENT_INTERFACE (G_TYPE_LIST_MODEL,
 +                                                nautilus_grid_row_model_list_model_init)
 +                         G_IMPLEMENT_INTERFACE (GTK_TYPE_SECTION_MODEL,
@@ -527,7 +528,7 @@ index 0000000..7f8f148
 +}
 diff --git a/src/nautilus-grid-row-model.h b/src/nautilus-grid-row-model.h
 new file mode 100644
-index 0000000..50653a5
+index 000000000..50653a57a
 --- /dev/null
 +++ b/src/nautilus-grid-row-model.h
 @@ -0,0 +1,42 @@
@@ -574,7 +575,7 @@ index 0000000..50653a5
 +
 +G_END_DECLS
 diff --git a/src/nautilus-grid-view.c b/src/nautilus-grid-view.c
-index 362d3cc..c7f8430 100644
+index b10bce15f..5eb468ab5 100644
 --- a/src/nautilus-grid-view.c
 +++ b/src/nautilus-grid-view.c
 @@ -9,7 +9,9 @@
@@ -806,17 +807,7 @@ index 362d3cc..c7f8430 100644
  static void
  bind_cell (GtkSignalListItemFactory *factory,
             GtkListItem              *listitem,
-@@ -426,9 +486,6 @@ bind_cell (GtkSignalListItemFactory *factory,
-     {
-         GtkWidget *parent;
- 
--        /* At the time of ::setup emission, the item ui has got no parent yet,
--         * that's why we need to complete the widget setup process here, on the
--         * first time ::bind is emitted. */
-         parent = gtk_widget_get_parent (cell);
-         gtk_widget_set_halign (parent, GTK_ALIGN_CENTER);
-         gtk_widget_set_valign (parent, GTK_ALIGN_START);
-@@ -444,8 +501,7 @@ unbind_cell (GtkSignalListItemFactory *factory,
+@@ -438,8 +498,7 @@ unbind_cell (GtkSignalListItemFactory *factory,
  
      item = get_view_item (listitem);
  
@@ -826,7 +817,7 @@ index 362d3cc..c7f8430 100644
      {
          nautilus_view_item_set_item_ui (item, NULL);
      }
-@@ -471,8 +527,6 @@ setup_cell (GtkSignalListItemFactory *factory,
+@@ -464,8 +523,6 @@ setup_cell (GtkSignalListItemFactory *factory,
  
      nautilus_grid_cell_set_caption_attributes (cell, self->caption_attributes);
  
@@ -835,7 +826,7 @@ index 362d3cc..c7f8430 100644
      expression = gtk_property_expression_new (GTK_TYPE_LIST_ITEM, NULL, "item");
      expression = gtk_property_expression_new (GTK_TYPE_TREE_LIST_ROW, expression, "item");
      expression = gtk_property_expression_new (NAUTILUS_TYPE_VIEW_ITEM, expression, "file");
-@@ -484,15 +538,50 @@ static void
+@@ -477,15 +534,50 @@ static void
  on_model_changed (NautilusGridView *self)
  {
      NautilusViewModel *model = nautilus_list_base_get_model (NAUTILUS_LIST_BASE (self));
@@ -889,7 +880,7 @@ index 362d3cc..c7f8430 100644
  static GtkGridView *
  create_view_ui (NautilusGridView *self)
  {
-@@ -506,12 +595,6 @@ create_view_ui (NautilusGridView *self)
+@@ -499,12 +591,6 @@ create_view_ui (NautilusGridView *self)
  
      widget = gtk_grid_view_new (NULL, factory);
  
@@ -902,7 +893,7 @@ index 362d3cc..c7f8430 100644
      gtk_grid_view_set_single_click_activate (GTK_GRID_VIEW (widget), FALSE);
      gtk_grid_view_set_max_columns (GTK_GRID_VIEW (widget), 20);
      gtk_grid_view_set_tab_behavior (GTK_GRID_VIEW (widget), GTK_LIST_TAB_ITEM);
-@@ -523,23 +606,131 @@ create_view_ui (NautilusGridView *self)
+@@ -516,23 +602,131 @@ create_view_ui (NautilusGridView *self)
                                      _("View of the current location"),
                                      -1);
  
@@ -924,7 +915,7 @@ index 362d3cc..c7f8430 100644
 +    GtkLayoutManager parent_instance;
 +};
 +
-+G_DEFINE_TYPE (NautilusGridLayout, nautilus_grid_layout, GTK_TYPE_LAYOUT_MANAGER)
++G_DEFINE_FINAL_TYPE (NautilusGridLayout, nautilus_grid_layout, GTK_TYPE_LAYOUT_MANAGER)
 +
 +static GtkSizeRequestMode
 +grid_layout_get_request_mode (GtkLayoutManager *manager,
@@ -1037,7 +1028,7 @@ index 362d3cc..c7f8430 100644
      list_base_view_class->get_icon_size = real_get_icon_size;
      list_base_view_class->get_sort_state = real_get_sort_state;
      list_base_view_class->get_view_info = real_get_view_info;
-@@ -558,6 +749,7 @@ nautilus_grid_view_init (NautilusGridView *self)
+@@ -551,6 +745,7 @@ nautilus_grid_view_init (NautilusGridView *self)
      GtkWidget *scrolled_window = nautilus_list_base_get_scrolled_window (NAUTILUS_LIST_BASE (self));
  
      gtk_widget_add_css_class (GTK_WIDGET (self), "nautilus-grid-view");
@@ -1045,7 +1036,7 @@ index 362d3cc..c7f8430 100644
  
      set_captions_from_preferences (self);
      g_signal_connect_object (nautilus_icon_view_preferences,
-@@ -566,11 +758,17 @@ nautilus_grid_view_init (NautilusGridView *self)
+@@ -559,11 +754,17 @@ nautilus_grid_view_init (NautilusGridView *self)
                               self,
                               G_CONNECT_SWAPPED);
  
@@ -1066,7 +1057,7 @@ index 362d3cc..c7f8430 100644
                                     GTK_WIDGET (self->view_ui));
 diff --git a/src/nautilus-grouped-grid.c b/src/nautilus-grouped-grid.c
 new file mode 100644
-index 0000000..82d806e
+index 000000000..bc2d2eb78
 --- /dev/null
 +++ b/src/nautilus-grouped-grid.c
 @@ -0,0 +1,1221 @@
@@ -1121,7 +1112,7 @@ index 0000000..82d806e
 +    GQuark caption_attributes[NAUTILUS_GRID_CELL_N_CAPTIONS];
 +};
 +
-+G_DEFINE_TYPE (NautilusGroupedGrid, nautilus_grouped_grid, G_TYPE_OBJECT)
++G_DEFINE_FINAL_TYPE (NautilusGroupedGrid, nautilus_grouped_grid, G_TYPE_OBJECT)
 +
 +static guint
 +get_icon_size_for_zoom_level (NautilusGridZoomLevel zoom_level)
@@ -2293,7 +2284,7 @@ index 0000000..82d806e
 +}
 diff --git a/src/nautilus-grouped-grid.h b/src/nautilus-grouped-grid.h
 new file mode 100644
-index 0000000..16eae82
+index 000000000..16eae82f3
 --- /dev/null
 +++ b/src/nautilus-grouped-grid.h
 @@ -0,0 +1,40 @@
@@ -2337,11 +2328,41 @@ index 0000000..16eae82
 +                                                                    GtkDirectionType       direction);
 +
 +G_END_DECLS
-diff --git a/test/automated/display/test-files-view.c b/test/automated/display/test-files-view.c
-index 92967c2..e706e63 100644
---- a/test/automated/display/test-files-view.c
-+++ b/test/automated/display/test-files-view.c
-@@ -1423,9 +1423,13 @@ main (int   argc,
+diff --git a/src/nautilus-list-base-private.h b/src/nautilus-list-base-private.h
+index 33cb4a971..246a3104c 100644
+--- a/src/nautilus-list-base-private.h
++++ b/src/nautilus-list-base-private.h
+@@ -30,8 +30,6 @@ void                          setup_cell_common                 (GObject
+                                                                  GtkWidget        *hover_target);
+ void                          setup_cell_gestures               (NautilusViewCell *cell);
+ void                          setup_cell_hover                  (NautilusViewCell *cell);
+-void                          setup_cell_hover_inner_target     (NautilusViewCell *cell,
+-                                                                 GtkWidget        *target);
+ GtkWidget                    *nautilus_list_base_create_group_header_widget (void);
+ void                          nautilus_list_base_bind_group_header_widget (GtkWidget        *header,
+                                                                            NautilusListBase *self,
+diff --git a/src/nautilus-list-base.c b/src/nautilus-list-base.c
+index 793c8057e..d5fb92cd9 100644
+--- a/src/nautilus-list-base.c
++++ b/src/nautilus-list-base.c
+@@ -924,12 +924,6 @@ setup_cell_hover (NautilusViewCell *cell)
+     real_setup_cell_hover (cell, GTK_WIDGET (cell));
+ }
+ 
+-void
+-setup_cell_hover_inner_target (NautilusViewCell *cell,
+-                               GtkWidget        *target)
+-{
+-    real_setup_cell_hover (cell, target);
+-}
+ 
+ void
+ setup_cell_common (GObject          *listitem,
+diff --git a/test/display/test-files-view.c b/test/display/test-files-view.c
+index ff1092193..93f9b9c50 100644
+--- a/test/display/test-files-view.c
++++ b/test/display/test-files-view.c
+@@ -1840,9 +1840,13 @@ main (int   argc,
      g_test_add_func ("/view/actions/zoom",
                       test_zoom_actions);
      g_test_add_data_func ("/view/grouping/list", GUINT_TO_POINTER (NAUTILUS_VIEW_LIST_ID), test_time_grouping);
@@ -2355,3 +2376,6 @@ index 92967c2..e706e63 100644
  
      return g_test_run ();
  }
+-- 
+2.56.0
+

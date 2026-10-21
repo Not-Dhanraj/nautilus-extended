@@ -1,21 +1,20 @@
-From e68665768a3bd0d037b31d8d55fd242e20b77a1a Mon Sep 17 00:00:00 2001
+From 0d112f7f1d5ef47ac2d59e5a21a4e1356fd16233 Mon Sep 17 00:00:00 2001
 From: Dhanraj <dp914278@gmail.com>
-Date: Wed, 21 Oct 2026 23:27:38 +0530
+Date: Thu, 22 Oct 2026 02:38:55 +0530
 Subject: [PATCH 5/5] Cycle typeahead matches in display order
 
-Integrate repeated-initial cycling and prefix search with grouped display order. Process type-select keys distinctly, retain normal search behavior, migrate the input caller, and remove the superseded sort accessor. Add the cycling regressions.
 ---
- NEWS                                     |  37 ++++-
- src/nautilus-files-view.c                |  14 --
- src/nautilus-files-view.h                |   5 -
- src/nautilus-query-editor.c              |  15 +-
- src/nautilus-query-editor.h              |   3 +-
- src/nautilus-window-slot.c               |  92 ++++++------
- test/automated/display/test-files-view.c | 184 +++++++++++++++++++++++
- 7 files changed, 276 insertions(+), 74 deletions(-)
+ NEWS                           |  37 ++++++-
+ src/nautilus-files-view.c      |  14 ---
+ src/nautilus-files-view.h      |   5 -
+ src/nautilus-query-editor.c    |  15 ++-
+ src/nautilus-query-editor.h    |   3 +-
+ src/nautilus-window-slot.c     |  92 ++++++++--------
+ test/display/test-files-view.c | 185 +++++++++++++++++++++++++++++++++
+ 7 files changed, 277 insertions(+), 74 deletions(-)
 
 diff --git a/NEWS b/NEWS
-index 07597df..ad82a29 100644
+index 901b6f9dc..c356393fa 100644
 --- a/NEWS
 +++ b/NEWS
 @@ -1,8 +1,35 @@
@@ -57,13 +56,13 @@ index 07597df..ad82a29 100644
 +  wrapping in display order. Mixed input remains a prefix search: E-E-X searches
 +  for EX. The one-second type-ahead reset and normal search are preserved.
  
- Major Changes in 50.1
+ Major Changes in 51.1
  =====================
 diff --git a/src/nautilus-files-view.c b/src/nautilus-files-view.c
-index f53a6d9..2453fb4 100644
+index 75126f1a0..5af58b34b 100644
 --- a/src/nautilus-files-view.c
 +++ b/src/nautilus-files-view.c
-@@ -9962,17 +9962,3 @@ nautilus_files_view_select_matching_name (NautilusFilesView *self,
+@@ -9982,17 +9982,3 @@ nautilus_files_view_select_matching_name (NautilusFilesView *self,
  
      return FALSE;
  }
@@ -82,10 +81,10 @@ index f53a6d9..2453fb4 100644
 -                                                NAUTILUS_PREFERENCES_SORT_DIRECTORIES_FIRST);
 -}
 diff --git a/src/nautilus-files-view.h b/src/nautilus-files-view.h
-index 0898343..72c3820 100644
+index 895a72e06..5bebe3948 100644
 --- a/src/nautilus-files-view.h
 +++ b/src/nautilus-files-view.h
-@@ -136,9 +136,4 @@ gboolean          nautilus_files_view_select_matching_name       (NautilusFilesV
+@@ -130,9 +130,4 @@ gboolean          nautilus_files_view_select_matching_name       (NautilusFilesV
                                                                    const char             *text,
                                                                    gboolean                cycle);
  
@@ -96,7 +95,7 @@ index 0898343..72c3820 100644
 -
  G_END_DECLS
 diff --git a/src/nautilus-query-editor.c b/src/nautilus-query-editor.c
-index 9e80287..58b0df6 100644
+index 54d2a7453..e053a375f 100644
 --- a/src/nautilus-query-editor.c
 +++ b/src/nautilus-query-editor.c
 @@ -890,7 +890,8 @@ gboolean
@@ -127,7 +126,7 @@ index 9e80287..58b0df6 100644
 +    return handled;
  }
 diff --git a/src/nautilus-query-editor.h b/src/nautilus-query-editor.h
-index 8f8cc43..e1d6d95 100644
+index 8f8cc4349..e1d6d95e2 100644
 --- a/src/nautilus-query-editor.h
 +++ b/src/nautilus-query-editor.h
 @@ -57,4 +57,5 @@ void           nautilus_query_editor_select_all_text (NautilusQueryEditor   *edi
@@ -138,10 +137,10 @@ index 8f8cc43..e1d6d95 100644
 +                                                      GdkModifierType        state,
 +                                                      gboolean               commit_immediately);
 diff --git a/src/nautilus-window-slot.c b/src/nautilus-window-slot.c
-index 4fa7619..4fe2d29 100644
+index 33d93a40c..eeea06863 100644
 --- a/src/nautilus-window-slot.c
 +++ b/src/nautilus-window-slot.c
-@@ -129,6 +129,7 @@ struct _NautilusWindowSlot
+@@ -127,6 +127,7 @@ struct _NautilusWindowSlot
      NautilusQueryEditor *query_editor;
      NautilusQuery *pending_search_query;
      guint clear_query_editor_timeout_id;
@@ -149,7 +148,7 @@ index 4fa7619..4fe2d29 100644
  
      /* Banner */
      AdwBanner *banner;
-@@ -404,27 +405,12 @@ type_ahead_search (void)
+@@ -398,27 +399,12 @@ type_ahead_search (void)
  static gboolean
  clear_query_editor_timeout_callback (NautilusWindowSlot *self)
  {
@@ -179,7 +178,7 @@ index 4fa7619..4fe2d29 100644
  
  static void
  query_editor_changed_callback (NautilusQueryEditor *editor,
-@@ -445,38 +431,39 @@ query_editor_changed_callback (NautilusQueryEditor *editor,
+@@ -439,38 +425,39 @@ query_editor_changed_callback (NautilusQueryEditor *editor,
      }
      else
      {
@@ -247,7 +246,7 @@ index 4fa7619..4fe2d29 100644
          }
  
          /* Reset timeout that clears type ahead query */
-@@ -492,6 +479,9 @@ hide_query_editor (NautilusWindowSlot *self)
+@@ -486,6 +473,9 @@ hide_query_editor (NautilusWindowSlot *self)
  {
      NautilusFilesView *view = self->content_view;
  
@@ -257,7 +256,7 @@ index 4fa7619..4fe2d29 100644
      nautilus_query_editor_set_query (self->query_editor, NULL);
  
      if (nautilus_files_view_is_searching (view))
-@@ -533,6 +523,9 @@ show_query_editor (NautilusWindowSlot *self)
+@@ -527,6 +517,9 @@ show_query_editor (NautilusWindowSlot *self)
          return;
      }
  
@@ -267,7 +266,7 @@ index 4fa7619..4fe2d29 100644
      if (nautilus_files_view_is_searching (self->content_view))
      {
          NautilusQuery *query = nautilus_files_view_get_search_query (self->content_view);
-@@ -643,6 +636,7 @@ nautilus_window_slot_handle_event (NautilusWindowSlot    *self,
+@@ -637,6 +630,7 @@ nautilus_window_slot_handle_event (NautilusWindowSlot    *self,
  {
      gboolean retval;
      GAction *action;
@@ -275,7 +274,7 @@ index 4fa7619..4fe2d29 100644
  
      retval = FALSE;
      action = g_action_map_lookup_action (G_ACTION_MAP (self->slot_action_group),
-@@ -672,10 +666,11 @@ nautilus_window_slot_handle_event (NautilusWindowSlot    *self,
+@@ -666,10 +660,11 @@ nautilus_window_slot_handle_event (NautilusWindowSlot    *self,
          retval = nautilus_query_editor_handle_event (self->query_editor,
                                                       controller,
                                                       keyval,
@@ -289,7 +288,7 @@ index 4fa7619..4fe2d29 100644
      {
          nautilus_window_slot_set_search_visible (self, TRUE);
      }
-@@ -2224,6 +2219,7 @@ apply_pending_location_and_selection_on_view (NautilusWindowSlot *self)
+@@ -2116,6 +2111,7 @@ apply_pending_location_and_selection_on_view (NautilusWindowSlot *self)
  
      nautilus_query_editor_set_query (self->query_editor, NULL);
      g_clear_handle_id (&self->clear_query_editor_timeout_id, g_source_remove);
@@ -297,7 +296,7 @@ index 4fa7619..4fe2d29 100644
  
      if (self->pending_file_to_activate != NULL)
      {
-@@ -2827,6 +2823,8 @@ nautilus_window_slot_dispose (GObject *object)
+@@ -2630,6 +2626,8 @@ nautilus_window_slot_dispose (GObject *object)
      NautilusWindowSlot *self;
      self = NAUTILUS_WINDOW_SLOT (object);
  
@@ -306,11 +305,11 @@ index 4fa7619..4fe2d29 100644
      g_signal_handlers_disconnect_by_data (nautilus_preferences, self);
  
      nautilus_window_slot_clear_forward_list (self);
-diff --git a/test/automated/display/test-files-view.c b/test/automated/display/test-files-view.c
-index e706e63..86eb222 100644
---- a/test/automated/display/test-files-view.c
-+++ b/test/automated/display/test-files-view.c
-@@ -1388,6 +1388,188 @@ test_name_grouping_folders (gconstpointer data)
+diff --git a/test/display/test-files-view.c b/test/display/test-files-view.c
+index 93f9b9c50..a3f6413e3 100644
+--- a/test/display/test-files-view.c
++++ b/test/display/test-files-view.c
+@@ -1790,6 +1790,189 @@ test_name_grouping_folders (gconstpointer data)
      test_clear_tmp_dir ();
  }
  
@@ -336,8 +335,9 @@ index e706e63..86eb222 100644
 +test_typeahead_cycling (gconstpointer data)
 +{
 +    guint view_id = GPOINTER_TO_UINT (data);
-+    g_autoptr (NautilusWindowSlot) slot = nautilus_window_slot_new (NAUTILUS_MODE_BROWSE);
-+    g_autoptr (NautilusFilesView) view = nautilus_files_view_new (view_id, slot);
++    g_autoptr (NautilusWindowSlot) slot = NULL;
++    g_autoptr (NautilusFilesView) view = create_view_with_slot (NAUTILUS_MODE_BROWSE,
++                                                             view_id, &slot);
 +    GActionGroup *actions = nautilus_files_view_get_private_action_group (view);
 +    g_autoptr (GFile) dir = g_file_new_build_filename (test_get_tmp_dir (), "typeahead", NULL);
 +    g_autoptr (GDateTime) now = g_date_time_new_now_local ();
@@ -499,7 +499,7 @@ index e706e63..86eb222 100644
  int
  main (int   argc,
        char *argv[])
-@@ -1430,6 +1612,8 @@ main (int   argc,
+@@ -1847,6 +2030,8 @@ main (int   argc,
      g_test_add_data_func ("/view/grouping/name/grid", GUINT_TO_POINTER (NAUTILUS_VIEW_GRID_ID), test_name_grouping);
      g_test_add_data_func ("/view/grouping/name/folders/list", GUINT_TO_POINTER (NAUTILUS_VIEW_LIST_ID), test_name_grouping_folders);
      g_test_add_data_func ("/view/grouping/name/folders/grid", GUINT_TO_POINTER (NAUTILUS_VIEW_GRID_ID), test_name_grouping_folders);
@@ -508,3 +508,6 @@ index e706e63..86eb222 100644
  
      return g_test_run ();
  }
+-- 
+2.56.0
+

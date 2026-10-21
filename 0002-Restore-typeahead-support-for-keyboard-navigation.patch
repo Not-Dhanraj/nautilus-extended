@@ -1,7 +1,9 @@
-From a05a54825446a6caa0e17600538bc7583564bcd7 Mon Sep 17 00:00:00 2001
+From 1813359a15273e0df8a922f258ea357b91848e81 Mon Sep 17 00:00:00 2001
 From: Xavier Claessens <xavier.claessens@collabora.com>
-Date: Tue, 7 Apr 2026 22:16:56 +0200
-Subject: [PATCH 2/2] Restore typeahead support for keyboard navigation
+Date: Thu, 22 Oct 2026 02:27:48 +0530
+Subject: [PATCH 2/5] Restore typeahead support for keyboard navigation
+
+Rebase preferences onto the Nautilus 51.1 toggle-group layout.
 
 Co-Authored-By: Bryan Lai <bryanlais@gmail.com>
 Co-Authored-By: DragoonAethis <dragoon@dragonic.eu>
@@ -35,10 +37,10 @@ index 3c14aa4d5..0af9e1d3a 100644
        <default>'local-only'</default>
        <summary>Where to perform recursive search</summary>
 diff --git a/src/nautilus-files-view.c b/src/nautilus-files-view.c
-index 236d00a1f..f81790920 100644
+index 17b410bd2..547a96fb8 100644
 --- a/src/nautilus-files-view.c
 +++ b/src/nautilus-files-view.c
-@@ -9787,3 +9787,17 @@ nautilus_files_view_get_private_list_base (NautilusFilesView *self)
+@@ -9808,3 +9808,17 @@ nautilus_files_view_get_private_list_base (NautilusFilesView *self)
  {
      return self->list_base;
  }
@@ -57,10 +59,10 @@ index 236d00a1f..f81790920 100644
 +                                                NAUTILUS_PREFERENCES_SORT_DIRECTORIES_FIRST);
 +}
 diff --git a/src/nautilus-files-view.h b/src/nautilus-files-view.h
-index a020ed808..b9b19102c 100644
+index 03c0f8b45..eff62eee7 100644
 --- a/src/nautilus-files-view.h
 +++ b/src/nautilus-files-view.h
-@@ -131,4 +131,9 @@ nautilus_files_view_get_private_action_group (NautilusFilesView *self);
+@@ -125,4 +125,9 @@ nautilus_files_view_get_private_action_group (NautilusFilesView *self);
  NautilusListBase *
  nautilus_files_view_get_private_list_base (NautilusFilesView *self);
  
@@ -83,7 +85,7 @@ index ca08bfaa6..05a5c7f36 100644
  /* Context menu options */
  #define NAUTILUS_PREFERENCES_SHOW_DELETE_PERMANENTLY "show-delete-permanently"
 diff --git a/src/nautilus-preferences-dialog.c b/src/nautilus-preferences-dialog.c
-index de009fa39..1e9e98a28 100644
+index 8ff575cbd..3ba2dbd1d 100644
 --- a/src/nautilus-preferences-dialog.c
 +++ b/src/nautilus-preferences-dialog.c
 @@ -42,6 +42,8 @@
@@ -93,9 +95,9 @@ index de009fa39..1e9e98a28 100644
 +#define NAUTILUS_PREFERENCES_DIALOG_TYPE_AHEAD_WIDGET                          \
 +        "type_ahead_search"
  
- /* combo preferences */
- #define NAUTILUS_PREFERENCES_DIALOG_OPEN_ACTION_COMBO                          \
-@@ -184,6 +186,9 @@ nautilus_preferences_dialog_setup (GtkBuilder *builder)
+ /* toggle group preferences */
+ #define NAUTILUS_PREFERENCES_DIALOG_OPEN_ACTION_TOGGLE_GROUP                   \
+@@ -195,6 +197,9 @@ nautilus_preferences_dialog_setup (GtkBuilder *builder)
      bind_builder_bool (builder, nautilus_preferences,
                         NAUTILUS_PREFERENCES_DIALOG_DELETE_PERMANENTLY_WIDGET,
                         NAUTILUS_PREFERENCES_SHOW_DELETE_PERMANENTLY);
@@ -106,7 +108,7 @@ index de009fa39..1e9e98a28 100644
      setup_detailed_date (builder);
  
 diff --git a/src/nautilus-query-editor.c b/src/nautilus-query-editor.c
-index 30514fb45..9e80287c0 100644
+index d1dd22324..54d2a7453 100644
 --- a/src/nautilus-query-editor.c
 +++ b/src/nautilus-query-editor.c
 @@ -816,6 +816,12 @@ nautilus_query_editor_set_query (NautilusQueryEditor *self,
@@ -123,10 +125,10 @@ index 30514fb45..9e80287c0 100644
      {
          text = nautilus_query_get_text (query);
 diff --git a/src/nautilus-window-slot.c b/src/nautilus-window-slot.c
-index 2e2c7bcfb..4fa7619b5 100644
+index c6a63af53..33d93a40c 100644
 --- a/src/nautilus-window-slot.c
 +++ b/src/nautilus-window-slot.c
-@@ -81,6 +81,9 @@ enum
+@@ -80,6 +80,9 @@ enum
  
  static guint signals[LAST_SIGNAL];
  
@@ -136,7 +138,7 @@ index 2e2c7bcfb..4fa7619b5 100644
  struct _NautilusWindowSlot
  {
      AdwBin parent_instance;
-@@ -125,6 +128,7 @@ struct _NautilusWindowSlot
+@@ -123,6 +126,7 @@ struct _NautilusWindowSlot
      /* Query editor */
      NautilusQueryEditor *query_editor;
      NautilusQuery *pending_search_query;
@@ -144,7 +146,7 @@ index 2e2c7bcfb..4fa7619b5 100644
  
      /* Banner */
      AdwBanner *banner;
-@@ -380,20 +384,107 @@ query_editor_focus_view_callback (NautilusQueryEditor *editor,
+@@ -374,20 +378,107 @@ query_editor_focus_view_callback (NautilusQueryEditor *editor,
      }
  }
  
@@ -258,7 +260,7 @@ index 2e2c7bcfb..4fa7619b5 100644
  }
  
  static void
-@@ -401,8 +492,6 @@ hide_query_editor (NautilusWindowSlot *self)
+@@ -395,8 +486,6 @@ hide_query_editor (NautilusWindowSlot *self)
  {
      NautilusFilesView *view = self->content_view;
  
@@ -267,7 +269,7 @@ index 2e2c7bcfb..4fa7619b5 100644
      nautilus_query_editor_set_query (self->query_editor, NULL);
  
      if (nautilus_files_view_is_searching (view))
-@@ -436,17 +525,6 @@ hide_query_editor (NautilusWindowSlot *self)
+@@ -430,17 +519,6 @@ hide_query_editor (NautilusWindowSlot *self)
      }
  }
  
@@ -285,7 +287,7 @@ index 2e2c7bcfb..4fa7619b5 100644
  static void
  show_query_editor (NautilusWindowSlot *self)
  {
-@@ -466,15 +544,6 @@ show_query_editor (NautilusWindowSlot *self)
+@@ -460,15 +538,6 @@ show_query_editor (NautilusWindowSlot *self)
      }
  
      gtk_widget_grab_focus (GTK_WIDGET (self->query_editor));
@@ -301,7 +303,7 @@ index 2e2c7bcfb..4fa7619b5 100644
  }
  
  static void
-@@ -606,7 +675,7 @@ nautilus_window_slot_handle_event (NautilusWindowSlot    *self,
+@@ -600,7 +669,7 @@ nautilus_window_slot_handle_event (NautilusWindowSlot    *self,
                                                       state);
      }
  
@@ -310,7 +312,7 @@ index 2e2c7bcfb..4fa7619b5 100644
      {
          nautilus_window_slot_set_search_visible (self, TRUE);
      }
-@@ -885,6 +954,15 @@ nautilus_window_slot_constructed (GObject *object)
+@@ -873,6 +942,15 @@ nautilus_window_slot_constructed (GObject *object)
      gtk_box_append (GTK_BOX (self->vbox), extras_vbox);
  
      self->query_editor = NAUTILUS_QUERY_EDITOR (nautilus_query_editor_new ());
@@ -326,7 +328,7 @@ index 2e2c7bcfb..4fa7619b5 100644
      /* We want to keep alive the query editor betwen additions and removals on the
       * UI, specifically when the toolbar adds or removes it */
      g_object_ref_sink (self->query_editor);
-@@ -2144,6 +2222,9 @@ apply_pending_location_and_selection_on_view (NautilusWindowSlot *self)
+@@ -2036,6 +2114,9 @@ apply_pending_location_and_selection_on_view (NautilusWindowSlot *self)
      nautilus_file_list_free (self->pending_selection);
      self->pending_selection = NULL;
  
@@ -337,12 +339,12 @@ index 2e2c7bcfb..4fa7619b5 100644
      {
          g_autoptr (GAppInfo) app_info = NULL;
 diff --git a/src/resources/ui/nautilus-preferences-dialog.blp b/src/resources/ui/nautilus-preferences-dialog.blp
-index 259ac1a2e..f6bb17c68 100644
+index fa03d206a..87d7c9c43 100644
 --- a/src/resources/ui/nautilus-preferences-dialog.blp
 +++ b/src/resources/ui/nautilus-preferences-dialog.blp
-@@ -24,6 +24,18 @@ Adw.PreferencesDialog preferences_dialog {
-         title: _("_Action to Open Items");
-         use-underline: true;
+@@ -39,6 +39,18 @@ Adw.PreferencesDialog preferences_dialog {
+           }
+         }
        }
 +
 +      Adw.ActionRow type_ahead_search_row {
@@ -360,5 +362,5 @@ index 259ac1a2e..f6bb17c68 100644
  
      Adw.PreferencesGroup {
 -- 
-2.53.0
+2.56.0
 

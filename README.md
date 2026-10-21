@@ -1,6 +1,6 @@
 # Nautilus type-ahead and folder grouping
 
-An Arch/CachyOS package for Nautilus with type-ahead navigation and per-folder time/name grouping.
+An Arch/CachyOS package for Nautilus 51.1 with type-ahead navigation and per-folder time/name grouping.
 > [!WARNING]
 > **AI disclosure**
 >
@@ -71,6 +71,8 @@ makepkg -o
 ```
 
 The source is under `src/nautilus/`. Patch files are generated diffs, not the source modules themselves.
+
+The 51.1 build also fetches the pinned `libgxdp` Git source required by Nautilus's portal integration. `MESON_PACKAGE_CACHE_DIR` points Meson at that verified source rather than letting it fetch an untracked subproject during the build.
 
 ## Source organization and patches
 

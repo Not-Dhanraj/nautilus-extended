@@ -17,8 +17,8 @@ pkgname=(
   libnautilus-extension-typeahead
 )
 packager="Albert Vaca Cintora <albertvaka@gmail.com>"
-pkgver=50.1
-pkgrel=11
+pkgver=51.1
+pkgrel=1
 pkgdesc="Default file manager for GNOME - Patched with typeahead navigation and per-folder time/name grouping"
 url="https://apps.gnome.org/Nautilus/"
 arch=(x86_64)
@@ -65,6 +65,7 @@ makedepends=(
 )
 source=(
   "git+https://gitlab.gnome.org/GNOME/nautilus.git#tag=${pkgver/[a-z]/.&}"
+  "git+https://gitlab.gnome.org/GNOME/libgxdp.git#commit=df896e3412b749947bc6f62a91a1aac8e6b6d19b"
   "0001-Restore-backspace-for-going-to-parent-folder.patch"
   "0002-Restore-typeahead-support-for-keyboard-navigation.patch"
   "0003-Add-per-folder-grouping-policy-and-list-sections.patch"
@@ -73,12 +74,13 @@ source=(
   "post.install"
 )
 b2sums=(
-  '7a69b11b6053a22858a000a8d0b0a39085b061dce6e5dab792fde58b5bed7f8464f2ef4aaadc1d83056f7ceff948b3c40f433f5fa4fb2d3c5865adf74b666460'
+  '13d7fde576d576c5903f1906263c8bd47e54bedcd88cd297077c4687b74eaef1519c458242ee1cb88ebad871411a44614404f12d21c9a7859d2b064c7e499dd1'
+  'f5bd238c316a55784f97b1b7c8b498d3dfa727375cf8a1bf61f4771e306232b36752df8f61edb8d8c5da7c5e1a7acd8c0e85a53725af56e9b18b8dd1a6f284e0'
   'b9af0c0c3c9e233d13a1287d5f5fa7b159cff5532ccd589791c4916f34c69cc27755207cbec1c0a87ccce7a273d3e7d3f9c1d756e2a6bedae0124f30a214fef0'
-  '36aa7c865278fae3a9444f367cbe8104e3806bd35b580096a12d8af6e95db40c0d3a93ef7e02b4d2dcc46fd9a2dd8b6706d8089e815ead0efc8c3ed7cb8b672a'
-  '514c662e66b1bdacc8e92f0967bc7ca0f3888a121cef7cf5f2fed2ff2ef06f6b626cf5b2fec3518f8c5c671eac925257c0ebdf4d065bfe7e6ef0d2e8fc49aa77'
-  '0f939f1c038076ccdafd8e4de86b904225d3b88067300df1523669d6cccb9bf0c2fb8b8d216538f6fc7bee532996a22c0c60c22779052c8c8b6dc815de12f8e7'
-  '0710acd55228a0cf1de22141826236e2948b5cab6808678899ce76b339679ae29b1f37e156d77b227a01c47fd238d2bf5c1f34a076d1eae628cabd2224aafb67'
+  'a04d4c2311c2760850411722c369acb16702464045f3302644d5f086aa5c87bb7eba2fc631e551405793bbe3cf696a7e7397add73a1214f8bfcc2789a1aa17ff'
+  '5528cda10721118b0b86374a673a67ab1872f53d155ea0fde3018705b658560b68c750f6f8991142eefe2ff92cd16bc00fe25abb3ecf3bf7ed62f8ef5a4fb839'
+  'ccf465d9133a59d5bec5236f35ad06f5a9d9ff7287d939147b3e0d7ba0a37b5aa05f5fe0c9da9631e72a59537e5150e3f0738329cbad6819834b257649a14421'
+  '9606361e2de3a92d0061ed979e926893b8a4c0e020f5dacdafe1b755a3cf4680f28b4c721fc4cce95f4493d3fddbdd575fe4c390758c8c3ee07b4b309827ef46'
   '7ba197c2e65108ab49c1795c44264181c3c6b8f7d6641d1b1353690202c915e0aed574f45467924f6fb67a65f9487a3c0e24252633066e25b4d2c0dac3609245'
 )
 
@@ -107,10 +109,6 @@ prepare() {
   # Enable typeahead behavior by default
   gawk -i inplace '/type-ahead-search/{c++;} c==1 && /true/{sub("true", "false"); c++;} 1' data/org.gnome.nautilus.gschema.xml
 
-  # GLib 2.90 introduced g_set_date_time(), which collides with Nautilus's
-  # internal helper of the same name in the 50.1 source release.
-  find src -type f \( -name '*.c' -o -name '*.h' \) -exec \
-    sed -i 's/\<g_set_date_time\>/nautilus_set_date_time/g' {} +
 }
 
 build() {
@@ -118,6 +116,9 @@ build() {
     -D docs=false
     -D selinux=disabled
   )
+
+  # Provide the pinned libgxdp source for Meson's fallback subproject.
+  export MESON_PACKAGE_CACHE_DIR="$srcdir"
 
   arch-meson nautilus build "${meson_options[@]}"
   meson compile -C build

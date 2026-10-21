@@ -1,20 +1,20 @@
-From 6d6ab374f7633d2cfa86d4588464ce3bd99cda9e Mon Sep 17 00:00:00 2001
+From a536c33beadedaea5fc8c431f60add1d19b8e118 Mon Sep 17 00:00:00 2001
 From: Dhanraj <dp914278@gmail.com>
-Date: Wed, 21 Oct 2026 23:27:38 +0530
+Date: Thu, 22 Oct 2026 02:35:26 +0530
 Subject: [PATCH 3/5] Add per-folder grouping policy and list sections
 
-Separate time/name classification from view lifecycle. Add per-folder controls, metadata migration, live heading bindings, and list regressions. The existing 0002 input caller retains its accessor until the later input-integration commit.
+Separate time/name classification from view lifecycle. Add per-folder controls, metadata migration, live heading bindings, and list regressions. Remap display tests to test/display/ and adapt test constructors to create_view_with_slot for 51.1.
 ---
  NEWS                                        |   6 +
  po/POTFILES.in                              |   1 +
  src/meson.build                             |   2 +
  src/nautilus-enums.h                        |   7 +
- src/nautilus-file-grouping.c                | 415 +++++++++++++++
+ src/nautilus-file-grouping.c                | 414 +++++++++++++++
  src/nautilus-file-grouping.h                |  34 ++
  src/nautilus-files-view.c                   | 174 +++++++
  src/nautilus-files-view.h                   |   5 +
- src/nautilus-list-base-private.h            |   7 +
- src/nautilus-list-base.c                    | 503 ++++++++++++++++++-
+ src/nautilus-list-base-private.h            |  10 +
+ src/nautilus-list-base.c                    | 529 +++++++++++++++++++-
  src/nautilus-list-base.h                    |   6 +
  src/nautilus-list-view.c                    |  24 +
  src/nautilus-metadata.c                     |   2 +
@@ -22,13 +22,13 @@ Separate time/name classification from view lifecycle. Add per-folder controls, 
  src/nautilus-view-model.c                   |   7 +
  src/resources/style.css                     |  54 +-
  src/resources/ui/nautilus-view-controls.blp |  21 +
- test/automated/display/test-files-view.c    | 528 ++++++++++++++++++++
- 18 files changed, 1787 insertions(+), 12 deletions(-)
+ test/display/test-files-view.c              | 529 ++++++++++++++++++++
+ 18 files changed, 1813 insertions(+), 15 deletions(-)
  create mode 100644 src/nautilus-file-grouping.c
  create mode 100644 src/nautilus-file-grouping.h
 
 diff --git a/NEWS b/NEWS
-index 3572140..68af020 100644
+index aeded9614..f91f45755 100644
 --- a/NEWS
 +++ b/NEWS
 @@ -1,3 +1,9 @@
@@ -38,14 +38,14 @@ index 3572140..68af020 100644
 +- Keep folders-first within sections and preserve older folder preferences.
 +- Isolate classification and calendar policy from view/header lifecycle code.
 +
- Major Changes in 50.1
+ Major Changes in 51.1
  =====================
  * Bugfixes:
 diff --git a/po/POTFILES.in b/po/POTFILES.in
-index 3fe597e..88027d5 100644
+index 67aa5516d..53d477a3d 100644
 --- a/po/POTFILES.in
 +++ b/po/POTFILES.in
-@@ -31,6 +31,7 @@ src/nautilus-file-chooser.c
+@@ -32,6 +32,7 @@ src/nautilus-file-chooser.c
  src/nautilus-file-conflict-dialog.c
  src/nautilus-file-operations.c
  src/nautilus-file-undo-operations.c
@@ -54,10 +54,10 @@ index 3fe597e..88027d5 100644
  src/nautilus-filename-utilities.c
  src/nautilus-filename-validator.c
 diff --git a/src/meson.build b/src/meson.build
-index 35b5482..bad0da5 100644
+index 2fe4ffbc3..d28468664 100644
 --- a/src/meson.build
 +++ b/src/meson.build
-@@ -89,6 +89,8 @@ libnautilus_sources = [
+@@ -108,6 +108,8 @@ libnautilus_sources = [
    'nautilus-file-chooser.h',
    'nautilus-file-conflict-dialog.c',
    'nautilus-file-conflict-dialog.h',
@@ -67,10 +67,10 @@ index 35b5482..bad0da5 100644
    'nautilus-file-operations-dbus-data.h',
    'nautilus-file-operations.c',
 diff --git a/src/nautilus-enums.h b/src/nautilus-enums.h
-index 13e4319..bb52f9d 100644
+index 921c74b37..e06e279fa 100644
 --- a/src/nautilus-enums.h
 +++ b/src/nautilus-enums.h
-@@ -46,6 +46,13 @@ typedef enum
+@@ -48,6 +48,13 @@ typedef enum
      NAUTILUS_GRID_ZOOM_LEVEL_EXTRA_LARGE,
  } NautilusGridZoomLevel;
  
@@ -86,10 +86,10 @@ index 13e4319..bb52f9d 100644
      NAUTILUS_LIST_ICON_SIZE_SMALL  = 16,
 diff --git a/src/nautilus-file-grouping.c b/src/nautilus-file-grouping.c
 new file mode 100644
-index 0000000..712562d
+index 000000000..cbe122c8e
 --- /dev/null
 +++ b/src/nautilus-file-grouping.c
-@@ -0,0 +1,415 @@
+@@ -0,0 +1,414 @@
 +/*
 + * Copyright (C) 2022 The GNOME project contributors
 + *
@@ -504,10 +504,9 @@ index 0000000..712562d
 +
 +    return NULL;
 +}
-+
 diff --git a/src/nautilus-file-grouping.h b/src/nautilus-file-grouping.h
 new file mode 100644
-index 0000000..4171051
+index 000000000..417105191
 --- /dev/null
 +++ b/src/nautilus-file-grouping.h
 @@ -0,0 +1,34 @@
@@ -546,10 +545,10 @@ index 0000000..4171051
 +
 +G_END_DECLS
 diff --git a/src/nautilus-files-view.c b/src/nautilus-files-view.c
-index c371ffd..ef39e4d 100644
+index 547a96fb8..306e1b03e 100644
 --- a/src/nautilus-files-view.c
 +++ b/src/nautilus-files-view.c
-@@ -610,6 +610,83 @@ update_sort_order_from_metadata_and_preferences (NautilusFilesView *self)
+@@ -605,6 +605,83 @@ update_sort_order_from_metadata_and_preferences (NautilusFilesView *self)
      g_signal_handlers_unblock_by_func (self->view_action_group, on_sort_action_state_changed, self);
  }
  
@@ -633,7 +632,7 @@ index c371ffd..ef39e4d 100644
  static gboolean
  focus_is_on_popup (GtkRoot *window)
  {
-@@ -639,6 +716,7 @@ files_view_begin_loading (NautilusFilesView *self)
+@@ -634,6 +711,7 @@ files_view_begin_loading (NautilusFilesView *self)
      nautilus_files_view_update_toolbar_menus (self);
  
      nautilus_list_base_setup_directory (self->list_base, self->directory);
@@ -641,7 +640,7 @@ index c371ffd..ef39e4d 100644
  
      GtkRoot *window = gtk_widget_get_root (GTK_WIDGET (self));
  
-@@ -2561,6 +2639,34 @@ action_sort_order_changed (GSimpleAction *action,
+@@ -2581,6 +2659,34 @@ action_sort_order_changed (GSimpleAction *action,
      g_simple_action_set_state (action, value);
  }
  
@@ -676,7 +675,7 @@ index c371ffd..ef39e4d 100644
  static void
  action_visible_columns (GSimpleAction *action,
                          GVariant      *state,
-@@ -3196,6 +3302,7 @@ connect_inner_view (NautilusFilesView *self)
+@@ -3211,6 +3317,7 @@ connect_inner_view (NautilusFilesView *self)
      g_object_bind_property (G_SIMPLE_ACTION (action), "state",
                              self->list_base, "sort-state",
                              G_BINDING_BIDIRECTIONAL | G_BINDING_SYNC_CREATE);
@@ -684,7 +683,7 @@ index c371ffd..ef39e4d 100644
  
      g_signal_connect_object (self->list_base, "activate-selection",
                               G_CALLBACK (nautilus_files_view_activate_selection), self,
-@@ -6814,6 +6921,7 @@ const GActionEntry view_entries[] =
+@@ -6901,6 +7008,7 @@ const GActionEntry view_entries[] =
      { .name = "zoom-out", .activate = action_zoom_out },
      { .name = "zoom-standard", .activate = action_zoom_standard },
      { .name = "sort", .parameter_type = "(sb)", .state = "('invalid',false)", .change_state = action_sort_order_changed },
@@ -692,7 +691,7 @@ index c371ffd..ef39e4d 100644
      { .name = "show-hidden-files", .state = "true", .change_state = action_show_hidden_files },
      { .name = "visible-columns", .activate = action_visible_columns },
      { .name = "visible-captions", .activate = action_visible_captions },
-@@ -8376,6 +8484,7 @@ view_directory_changed_callback (NautilusFile *file,
+@@ -8437,6 +8545,7 @@ view_directory_changed_callback (NautilusFile *file,
      NautilusFilesView *view = NAUTILUS_FILES_VIEW (callback_data);
  
      schedule_changes (view);
@@ -700,7 +699,7 @@ index c371ffd..ef39e4d 100644
  
      schedule_update_context_menus (view);
      schedule_update_status (view);
-@@ -9789,6 +9898,71 @@ nautilus_files_view_get_private_list_base (NautilusFilesView *self)
+@@ -9809,6 +9918,71 @@ nautilus_files_view_get_private_list_base (NautilusFilesView *self)
      return self->list_base;
  }
  
@@ -773,10 +772,10 @@ index c371ffd..ef39e4d 100644
  nautilus_files_view_get_sort_state(NautilusFilesView *view,
                                     GQuark            *sort_attribute,
 diff --git a/src/nautilus-files-view.h b/src/nautilus-files-view.h
-index b9b1910..0898343 100644
+index eff62eee7..895a72e06 100644
 --- a/src/nautilus-files-view.h
 +++ b/src/nautilus-files-view.h
-@@ -131,6 +131,11 @@ nautilus_files_view_get_private_action_group (NautilusFilesView *self);
+@@ -125,6 +125,11 @@ nautilus_files_view_get_private_action_group (NautilusFilesView *self);
  NautilusListBase *
  nautilus_files_view_get_private_list_base (NautilusFilesView *self);
  
@@ -789,17 +788,17 @@ index b9b1910..0898343 100644
                                                                    GQuark                 *sort_attribute,
                                                                    gboolean               *reversed,
 diff --git a/src/nautilus-list-base-private.h b/src/nautilus-list-base-private.h
-index ddf313d..76c8a3e 100644
+index 6209de063..33cb4a971 100644
 --- a/src/nautilus-list-base-private.h
 +++ b/src/nautilus-list-base-private.h
-@@ -27,8 +27,15 @@ void               nautilus_list_base_setup_gestures (NautilusListBase *self);
- /* Shareable helpers */
+@@ -28,5 +28,15 @@ void               nautilus_list_base_setup_gestures (NautilusListBase *self);
  void                          setup_cell_common                 (GObject          *listitem,
-                                                                  NautilusViewCell *cell);
+                                                                  NautilusViewCell *cell,
+                                                                  GtkWidget        *hover_target);
 +void                          setup_cell_gestures               (NautilusViewCell *cell);
- void                          setup_cell_hover                  (NautilusViewCell *cell);
- void                          setup_cell_hover_inner_target     (NautilusViewCell *cell,
-                                                                  GtkWidget        *target);
++void                          setup_cell_hover                  (NautilusViewCell *cell);
++void                          setup_cell_hover_inner_target     (NautilusViewCell *cell,
++                                                                 GtkWidget        *target);
 +GtkWidget                    *nautilus_list_base_create_group_header_widget (void);
 +void                          nautilus_list_base_bind_group_header_widget (GtkWidget        *header,
 +                                                                           NautilusListBase *self,
@@ -809,7 +808,7 @@ index ddf313d..76c8a3e 100644
  
  G_END_DECLS
 diff --git a/src/nautilus-list-base.c b/src/nautilus-list-base.c
-index 4f4060c..1adc8ba 100644
+index a4b4f0654..793c8057e 100644
 --- a/src/nautilus-list-base.c
 +++ b/src/nautilus-list-base.c
 @@ -15,10 +15,12 @@
@@ -856,12 +855,13 @@ index 4f4060c..1adc8ba 100644
      N_PROPS
  };
  
-@@ -815,18 +823,11 @@ on_view_drop (GtkDropTarget *target,
+@@ -862,19 +870,11 @@ on_view_drop (GtkDropTarget *target,
  }
  
  void
 -setup_cell_common (GObject          *listitem,
--                   NautilusViewCell *cell)
+-                   NautilusViewCell *cell,
+-                   GtkWidget        *hover_target)
 +setup_cell_gestures (NautilusViewCell *cell)
  {
 -    GtkExpression *expression;
@@ -876,13 +876,41 @@ index 4f4060c..1adc8ba 100644
      controller = GTK_EVENT_CONTROLLER (gtk_gesture_click_new ());
      gtk_widget_add_controller (GTK_WIDGET (cell), controller);
      gtk_event_controller_set_propagation_phase (controller, GTK_PHASE_BUBBLE);
-@@ -859,6 +860,20 @@ setup_cell_common (GObject          *listitem,
+@@ -906,12 +906,47 @@ setup_cell_common (GObject          *listitem,
+     g_signal_connect (drop_target, "drop", G_CALLBACK (on_item_drop), cell);
      gtk_widget_add_controller (GTK_WIDGET (cell), GTK_EVENT_CONTROLLER (drop_target));
- }
  
+-    controller = gtk_drop_controller_motion_new ();
+-    gtk_widget_add_controller (hover_target, controller);
++}
++
++static void
++real_setup_cell_hover (NautilusViewCell *cell,
++                       GtkWidget        *target)
++{
++    GtkEventController *controller = gtk_drop_controller_motion_new ();
++    gtk_widget_add_controller (target, controller);
+     g_signal_connect (controller, "enter", G_CALLBACK (on_item_drag_hover_enter), cell);
+     g_signal_connect (controller, "leave", G_CALLBACK (on_item_drag_hover_leave), cell);
+     g_signal_connect (controller, "motion", G_CALLBACK (on_item_drag_hover_motion), cell);
+ }
++void
++setup_cell_hover (NautilusViewCell *cell)
++{
++    real_setup_cell_hover (cell, GTK_WIDGET (cell));
++}
++
++void
++setup_cell_hover_inner_target (NautilusViewCell *cell,
++                               GtkWidget        *target)
++{
++    real_setup_cell_hover (cell, target);
++}
++
 +void
 +setup_cell_common (GObject          *listitem,
-+                   NautilusViewCell *cell)
++                   NautilusViewCell *cell,
++                   GtkWidget        *hover_target)
 +{
 +    GtkExpression *expression;
 +
@@ -892,12 +920,13 @@ index 4f4060c..1adc8ba 100644
 +    g_object_bind_property (listitem, "position", cell, "position", G_BINDING_SYNC_CREATE);
 +
 +    setup_cell_gestures (cell);
++    real_setup_cell_hover (cell, hover_target);
 +}
 +
+ 
  static void
- real_setup_cell_hover (NautilusViewCell *cell,
-                        GtkWidget        *target)
-@@ -942,6 +957,12 @@ base_setup_directory (NautilusListBase  *self,
+ nautilus_list_base_scroll_to_item (NautilusListBase *self,
+@@ -970,6 +1005,12 @@ base_setup_directory (NautilusListBase  *self,
          gtk_scrolled_window_set_kinetic_scrolling (content, FALSE);
          gtk_scrolled_window_set_kinetic_scrolling (content, TRUE);
      }
@@ -910,7 +939,7 @@ index 4f4060c..1adc8ba 100644
  }
  
  static void
-@@ -1028,12 +1049,448 @@ default_preview_selection_event (NautilusListBase *self,
+@@ -1056,12 +1097,448 @@ default_preview_selection_event (NautilusListBase *self,
      nautilus_list_base_set_cursor (self, i, TRUE, TRUE);
  }
  
@@ -1360,7 +1389,7 @@ index 4f4060c..1adc8ba 100644
      g_clear_object (&priv->directory_as_file);
      g_clear_object (&priv->model);
      g_clear_handle_id (&priv->hover_timer_id, g_source_remove);
-@@ -1171,6 +1628,12 @@ nautilus_list_base_get_property (GObject    *object,
+@@ -1199,6 +1676,12 @@ nautilus_list_base_get_property (GObject    *object,
              g_value_take_variant (value, nautilus_list_base_get_sort_state (self));
          }
          break;
@@ -1373,7 +1402,7 @@ index 4f4060c..1adc8ba 100644
  
          default:
          {
-@@ -1186,13 +1649,18 @@ nautilus_list_base_set_property (GObject      *object,
+@@ -1214,13 +1697,18 @@ nautilus_list_base_set_property (GObject      *object,
                                   GParamSpec   *pspec)
  {
      NautilusListBase *self = NAUTILUS_LIST_BASE (object);
@@ -1394,7 +1423,7 @@ index 4f4060c..1adc8ba 100644
          }
          break;
  
-@@ -1240,6 +1708,11 @@ nautilus_list_base_class_init (NautilusListBaseClass *klass)
+@@ -1268,6 +1756,11 @@ nautilus_list_base_class_init (NautilusListBaseClass *klass)
                                                          G_VARIANT_TYPE ("(sb)"),
                                                          NULL,
                                                          G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY | G_PARAM_STATIC_STRINGS);
@@ -1406,7 +1435,7 @@ index 4f4060c..1adc8ba 100644
      g_object_class_install_properties (object_class, N_PROPS, properties);
  
      signals[ACTIVATE_SELECTION] = g_signal_new ("activate-selection",
-@@ -1275,6 +1748,11 @@ nautilus_list_base_class_init (NautilusListBaseClass *klass)
+@@ -1303,6 +1796,11 @@ nautilus_list_base_class_init (NautilusListBaseClass *klass)
                                                            G_TYPE_NONE, 3,
                                                            G_TYPE_DOUBLE, G_TYPE_DOUBLE,
                                                            GTK_TYPE_WIDGET);
@@ -1418,7 +1447,7 @@ index 4f4060c..1adc8ba 100644
  }
  
  static void
-@@ -1283,6 +1761,8 @@ nautilus_list_base_init (NautilusListBase *self)
+@@ -1311,6 +1809,8 @@ nautilus_list_base_init (NautilusListBase *self)
      NautilusListBasePrivate *priv = nautilus_list_base_get_instance_private (self);
      GtkEventController *controller;
  
@@ -1427,7 +1456,7 @@ index 4f4060c..1adc8ba 100644
      priv->scrolled_window = gtk_scrolled_window_new ();
      priv->overlay = gtk_overlay_new ();
  
-@@ -1298,6 +1778,7 @@ nautilus_list_base_init (NautilusListBase *self)
+@@ -1326,6 +1826,7 @@ nautilus_list_base_init (NautilusListBase *self)
                               "changed::" NAUTILUS_PREFERENCES_CLICK_POLICY,
                               G_CALLBACK (set_click_mode_from_settings), self,
                               G_CONNECT_SWAPPED);
@@ -1436,7 +1465,7 @@ index 4f4060c..1adc8ba 100644
  }
  
 diff --git a/src/nautilus-list-base.h b/src/nautilus-list-base.h
-index 9a494b9..71cf6cf 100644
+index 9a494b91e..71cf6cfbc 100644
 --- a/src/nautilus-list-base.h
 +++ b/src/nautilus-list-base.h
 @@ -73,5 +73,11 @@ void    nautilus_list_base_set_zoom_level          (NautilusListBase  *self,
@@ -1452,10 +1481,10 @@ index 9a494b9..71cf6cf 100644
  
  G_END_DECLS
 diff --git a/src/nautilus-list-view.c b/src/nautilus-list-view.c
-index 3191adc..065affc 100644
+index dedf28d95..13bbc0c10 100644
 --- a/src/nautilus-list-view.c
 +++ b/src/nautilus-list-view.c
-@@ -1069,6 +1069,26 @@ nautilus_list_view_reload (NautilusListView *self)
+@@ -1056,6 +1056,26 @@ nautilus_list_view_reload (NautilusListView *self)
      gtk_widget_activate_action (GTK_WIDGET (self), "slot.reload", NULL);
  }
  
@@ -1482,7 +1511,7 @@ index 3191adc..065affc 100644
  static void
  on_model_changed (NautilusListView *self)
  {
-@@ -1123,6 +1143,9 @@ nautilus_list_view_init (NautilusListView *self)
+@@ -1110,6 +1130,9 @@ nautilus_list_view_init (NautilusListView *self)
                               G_CONNECT_SWAPPED);
  
      self->view_ui = create_view_ui (self);
@@ -1492,7 +1521,7 @@ index 3191adc..065affc 100644
      nautilus_list_base_setup_gestures (NAUTILUS_LIST_BASE (self));
  
      setup_view_columns (self);
-@@ -1186,6 +1209,7 @@ nautilus_list_view_dispose (GObject *object)
+@@ -1173,6 +1196,7 @@ nautilus_list_view_dispose (GObject *object)
      g_clear_object (&self->file_path_base_location);
      g_clear_pointer (&self->factory_to_column_map, g_hash_table_destroy);
  
@@ -1501,7 +1530,7 @@ index 3191adc..065affc 100644
  
      G_OBJECT_CLASS (nautilus_list_view_parent_class)->dispose (object);
 diff --git a/src/nautilus-metadata.c b/src/nautilus-metadata.c
-index e462298..87146b6 100644
+index e462298ca..87146b6cb 100644
 --- a/src/nautilus-metadata.c
 +++ b/src/nautilus-metadata.c
 @@ -24,6 +24,8 @@ static char *used_metadata_names[] =
@@ -1514,7 +1543,7 @@ index e462298..87146b6 100644
      NAUTILUS_METADATA_KEY_LIST_VIEW_SORT_REVERSED,
      NAUTILUS_METADATA_KEY_LIST_VIEW_VISIBLE_COLUMNS,
 diff --git a/src/nautilus-metadata.h b/src/nautilus-metadata.h
-index 299e3a8..bb2c866 100644
+index 299e3a823..bb2c8666b 100644
 --- a/src/nautilus-metadata.h
 +++ b/src/nautilus-metadata.h
 @@ -32,6 +32,9 @@
@@ -1528,7 +1557,7 @@ index 299e3a8..bb2c866 100644
  #define NAUTILUS_METADATA_KEY_LIST_VIEW_SORT_COLUMN      	"nautilus-list-view-sort-column"
  #define NAUTILUS_METADATA_KEY_LIST_VIEW_SORT_REVERSED    	"nautilus-list-view-sort-reversed"
 diff --git a/src/nautilus-view-model.c b/src/nautilus-view-model.c
-index cb16080..3282cf2 100644
+index 98f8f4bf0..6be5a925a 100644
 --- a/src/nautilus-view-model.c
 +++ b/src/nautilus-view-model.c
 @@ -514,6 +514,13 @@ nautilus_view_model_set_section_sorter (NautilusViewModel *self,
@@ -1546,7 +1575,7 @@ index cb16080..3282cf2 100644
  
      if (sorter != NULL)
 diff --git a/src/resources/style.css b/src/resources/style.css
-index 7ba5fa5..85fc35c 100644
+index 4e8aed9c4..1973cdefc 100644
 --- a/src/resources/style.css
 +++ b/src/resources/style.css
 @@ -171,6 +171,51 @@
@@ -1627,7 +1656,7 @@ index 7ba5fa5..85fc35c 100644
  .nautilus-list-view columnview,
  placesview list {
    background: none;
-@@ -351,6 +402,7 @@ rubberband {
+@@ -350,6 +401,7 @@ rubberband {
  
  .nautilus-list-view listview,
  .nautilus-grid-view gridview,
@@ -1636,7 +1665,7 @@ index 7ba5fa5..85fc35c 100644
    --accent-bg-color: #959595;
    --accent-color: oklab(from var(--accent-bg-color) var(--standalone-color-oklab));
 diff --git a/src/resources/ui/nautilus-view-controls.blp b/src/resources/ui/nautilus-view-controls.blp
-index a5e3ca9..2dea0bc 100644
+index a5e3ca921..2dea0bccc 100644
 --- a/src/resources/ui/nautilus-view-controls.blp
 +++ b/src/resources/ui/nautilus-view-controls.blp
 @@ -24,6 +24,27 @@ menu view_menu {
@@ -1667,24 +1696,25 @@ index a5e3ca9..2dea0bc 100644
      item {
        label: _("Show _Hidden Files");
        action: "view.show-hidden-files";
-diff --git a/test/automated/display/test-files-view.c b/test/automated/display/test-files-view.c
-index 6f3600c..92967c2 100644
---- a/test/automated/display/test-files-view.c
-+++ b/test/automated/display/test-files-view.c
-@@ -14,9 +14,12 @@
+diff --git a/test/display/test-files-view.c b/test/display/test-files-view.c
+index 003d2d588..ff1092193 100644
+--- a/test/display/test-files-view.c
++++ b/test/display/test-files-view.c
+@@ -16,10 +16,13 @@
  #include <nautilus-files-view.h>
  #include <nautilus-global-preferences.h>
  #include <nautilus-list-base.h>
 +#include <nautilus-list-base-private.h>
 +#include <nautilus-metadata.h>
  #include <nautilus-resources.h>
+ #include <nautilus-query.h>
  #include <nautilus-tag-manager.h>
  #include <nautilus-view-info.h>
 +#include <nautilus-view-item.h>
  #include <nautilus-view-model.h>
  #include <nautilus-window-slot.h>
  
-@@ -864,6 +867,527 @@ test_load_dir (void)
+@@ -1265,6 +1268,528 @@ test_load_dir (void)
      test_clear_tmp_dir ();
  }
  
@@ -1692,8 +1722,8 @@ index 6f3600c..92967c2 100644
 +test_time_grouping (gconstpointer data)
 +{
 +    guint view_id = GPOINTER_TO_UINT (data);
-+    g_autoptr (NautilusWindowSlot) slot = nautilus_window_slot_new (NAUTILUS_MODE_BROWSE);
-+    g_autoptr (NautilusFilesView) view = nautilus_files_view_new (view_id, slot);
++    g_autoptr (NautilusWindowSlot) slot = NULL;
++    g_autoptr (NautilusFilesView) view = create_view_with_slot (NAUTILUS_MODE_BROWSE, view_id, &slot);
 +    NautilusListBase *base = nautilus_files_view_get_private_list_base (view);
 +    NautilusViewModel *model = nautilus_files_view_get_private_model (view);
 +    GActionGroup *actions = nautilus_files_view_get_private_action_group (view);
@@ -1805,8 +1835,9 @@ index 6f3600c..92967c2 100644
 +{
 +    gboolean saved_directories_first = g_settings_get_boolean (gtk_filechooser_preferences,
 +                                                              NAUTILUS_PREFERENCES_SORT_DIRECTORIES_FIRST);
-+    g_autoptr (NautilusWindowSlot) slot = nautilus_window_slot_new (NAUTILUS_MODE_BROWSE);
-+    g_autoptr (NautilusFilesView) view = nautilus_files_view_new (GPOINTER_TO_UINT (data), slot);
++    guint view_id = GPOINTER_TO_UINT (data);
++    g_autoptr (NautilusWindowSlot) slot = NULL;
++    g_autoptr (NautilusFilesView) view = create_view_with_slot (NAUTILUS_MODE_BROWSE, view_id, &slot);
 +    NautilusViewModel *model = nautilus_files_view_get_private_model (view);
 +    GActionGroup *actions = nautilus_files_view_get_private_action_group (view);
 +    g_autoptr (GFile) location = g_file_new_for_path (test_get_tmp_dir ());
@@ -1868,8 +1899,8 @@ index 6f3600c..92967c2 100644
 +test_name_grouping (gconstpointer data)
 +{
 +    guint view_id = GPOINTER_TO_UINT (data);
-+    g_autoptr (NautilusWindowSlot) slot = nautilus_window_slot_new (NAUTILUS_MODE_BROWSE);
-+    g_autoptr (NautilusFilesView) view = nautilus_files_view_new (view_id, slot);
++    g_autoptr (NautilusWindowSlot) slot = NULL;
++    g_autoptr (NautilusFilesView) view = create_view_with_slot (NAUTILUS_MODE_BROWSE, view_id, &slot);
 +    NautilusListBase *base = nautilus_files_view_get_private_list_base (view);
 +    NautilusViewModel *model = nautilus_files_view_get_private_model (view);
 +    GActionGroup *actions = nautilus_files_view_get_private_action_group (view);
@@ -2109,8 +2140,8 @@ index 6f3600c..92967c2 100644
 +    gboolean saved_directories_first = g_settings_get_boolean (gtk_filechooser_preferences,
 +                                                              NAUTILUS_PREFERENCES_SORT_DIRECTORIES_FIRST);
 +    guint view_id = GPOINTER_TO_UINT (data);
-+    g_autoptr (NautilusWindowSlot) slot = nautilus_window_slot_new (NAUTILUS_MODE_BROWSE);
-+    g_autoptr (NautilusFilesView) view = nautilus_files_view_new (view_id, slot);
++    g_autoptr (NautilusWindowSlot) slot = NULL;
++    g_autoptr (NautilusFilesView) view = create_view_with_slot (NAUTILUS_MODE_BROWSE, view_id, &slot);
 +    NautilusListBase *base = nautilus_files_view_get_private_list_base (view);
 +    NautilusViewModel *model = nautilus_files_view_get_private_model (view);
 +    GActionGroup *actions = nautilus_files_view_get_private_action_group (view);
@@ -2212,8 +2243,8 @@ index 6f3600c..92967c2 100644
  int
  main (int   argc,
        char *argv[])
-@@ -898,6 +1422,10 @@ main (int   argc,
-                      test_selection_actions);
+@@ -1314,6 +1839,10 @@ main (int   argc,
+                      test_open_item_location_in_search);
      g_test_add_func ("/view/actions/zoom",
                       test_zoom_actions);
 +    g_test_add_data_func ("/view/grouping/list", GUINT_TO_POINTER (NAUTILUS_VIEW_LIST_ID), test_time_grouping);
@@ -2223,3 +2254,6 @@ index 6f3600c..92967c2 100644
  
      return g_test_run ();
  }
+-- 
+2.56.0
+
