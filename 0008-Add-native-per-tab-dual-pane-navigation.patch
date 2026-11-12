@@ -1,0 +1,2375 @@
+From 50ac245149eaf66462e0a96109c9bb97afd92968 Mon Sep 17 00:00:00 2001
+From: Dhanraj <dp914278@gmail.com>
+Date: Sat, 31 Oct 2026 13:38:21 +0530
+Subject: [PATCH] window: Add complete native per-tab dual-pane navigation
+
+Wrap each tab page in a NautilusWindowTab with two real browse slots. Keep
+one weak active slot as shared toolbar/sidebar/action authority and isolate
+inactive managed shortcuts. F3 creates Home as the new pane location;
+Ctrl+W closes the focused pane and promotes its sibling.
+
+Include floating native card islands, rounded clipping, unclipped outer
+shadows, measured drag/window limits, proportional resizing and translation
+registration. Normalize incomplete close records, preserve valid histories,
+and restore post-promotion or ordinary reuse focus without stealing shared
+entry/background focus. Bind child callbacks to tab lifetime and dispose
+template state safely. No incremental feature-fix patches are required.
+
+Activate a split pane on pointer hover when no edit, popup/dialog, held
+button or drag is in progress. Keep keyboard context on the same pane
+without fighting a stationary pointer. Make the inactive surface recede
+and dim its file content while preserving native shadows and geometry.
+---
+diff --git a/po/POTFILES.in b/po/POTFILES.in
+index 619d87e..d067314 100644
+--- a/po/POTFILES.in
++++ b/po/POTFILES.in
+@@ -77,6 +77,7 @@ src/nautilus-vfs-file.c
+ src/nautilus-view-controls.c
+ src/nautilus-window.c
+ src/nautilus-window-slot.c
++src/nautilus-window-tab.c
+ src/nautilus-x-content-bar.c
+ src/resources/menu/nautilus-files-view-context-menus.ui
+ src/resources/menu/nautilus-pathbar-context-menu.ui
+diff --git a/src/meson.build b/src/meson.build
+index 979d1ea..3b0bad3 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -291,6 +291,8 @@ libnautilus_sources = [
+   'nautilus-window.h',
+   'nautilus-window-slot.c',
+   'nautilus-window-slot.h',
++  'nautilus-window-tab.c',
++  'nautilus-window-tab.h',
+   'nautilus-x-content-bar.c',
+   'nautilus-x-content-bar.h',
+ ]
+diff --git a/src/nautilus-files-view.c b/src/nautilus-files-view.c
+index 9750eb1..8bf341f 100644
+--- a/src/nautilus-files-view.c
++++ b/src/nautilus-files-view.c
+@@ -3167,6 +3167,11 @@ slot_active_changed (NautilusWindowSlot *slot,
+ 
+     view->active = nautilus_window_slot_get_active (slot);
+ 
++    gtk_shortcut_controller_set_scope (view->shortcuts,
++                                       view->active ? GTK_SHORTCUT_SCOPE_MANAGED : GTK_SHORTCUT_SCOPE_LOCAL);
++    gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (view->shortcuts),
++                                                view->active ? GTK_PHASE_BUBBLE : GTK_PHASE_NONE);
++
+     if (view->active)
+     {
+         /* Avoid updating the toolbar withouth making sure the toolbar
+@@ -9099,6 +9104,8 @@ on_parent_changed (GObject    *object,
+         if (nautilus_window_slot_get_active (self->slot))
+         {
+             self->active = TRUE;
++            gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (self->shortcuts), GTK_PHASE_BUBBLE);
++            gtk_shortcut_controller_set_scope (self->shortcuts, GTK_SHORTCUT_SCOPE_MANAGED);
+             gtk_widget_insert_action_group (GTK_WIDGET (gtk_widget_get_root (widget)),
+                                             "view",
+                                             G_ACTION_GROUP (self->view_action_group));
+@@ -9690,7 +9697,7 @@ nautilus_files_view_init (NautilusFilesView *self)
+ 
+     self->shortcuts = GTK_SHORTCUT_CONTROLLER (gtk_shortcut_controller_new ());
+ 
+-    gtk_shortcut_controller_set_scope (self->shortcuts, GTK_SHORTCUT_SCOPE_MANAGED);
++    gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (self->shortcuts), GTK_PHASE_NONE);
+     gtk_widget_add_controller (GTK_WIDGET (self), GTK_EVENT_CONTROLLER (self->shortcuts));
+ 
+     ADD_SHORTCUT_FOR_ACTION (self->shortcuts, "view.zoom-in", "<control>equal|<control>plus|<control>KP_Add|ZoomIn");
+diff --git a/src/nautilus-window-slot.c b/src/nautilus-window-slot.c
+index 1d1f26d..343b704 100644
+--- a/src/nautilus-window-slot.c
++++ b/src/nautilus-window-slot.c
+@@ -1415,7 +1415,7 @@ nautilus_window_slot_init (NautilusWindowSlot *self)
+ 
+     self->shortcuts = GTK_SHORTCUT_CONTROLLER (gtk_shortcut_controller_new ());
+ 
+-    gtk_shortcut_controller_set_scope (self->shortcuts, GTK_SHORTCUT_SCOPE_MANAGED);
++    gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (self->shortcuts), GTK_PHASE_NONE);
+     gtk_widget_add_controller (GTK_WIDGET (self), GTK_EVENT_CONTROLLER (self->shortcuts));
+ 
+ #define ADD_SHORTCUT_FOR_ACTION(controller, action, trigger) \
+@@ -2653,6 +2653,7 @@ nautilus_window_slot_dispose (GObject *object)
+     {
+         g_signal_handlers_disconnect_by_data (self->query_editor, self);
+     }
++
+     g_signal_handlers_disconnect_by_data (nautilus_preferences, self);
+ 
+     nautilus_window_slot_clear_forward_list (self);
+@@ -3015,6 +3016,12 @@ nautilus_window_slot_set_active (NautilusWindowSlot *self,
+ 
+         self->active = active;
+ 
++        /* Visible inactive panes must not register shortcuts on the window. */
++        gtk_shortcut_controller_set_scope (self->shortcuts,
++                                           active ? GTK_SHORTCUT_SCOPE_MANAGED : GTK_SHORTCUT_SCOPE_LOCAL);
++        gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (self->shortcuts),
++                                                    active ? GTK_PHASE_BUBBLE : GTK_PHASE_NONE);
++
+         if (active)
+         {
+             /* sync window to new slot */
+diff --git a/src/nautilus-window-tab.c b/src/nautilus-window-tab.c
+new file mode 100644
+index 0000000..63b53cc
+--- /dev/null
++++ b/src/nautilus-window-tab.c
+@@ -0,0 +1,1052 @@
++/*
++ * nautilus-window-tab.c: Tab wrapper widget for Nautilus dual pane architecture
++ *
++ * Copyright (C) 2026 The Nautilus Extended Authors
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <glib/gi18n.h>
++
++#include "nautilus-window-tab.h"
++#include "nautilus-scheme.h"
++#include "nautilus-grid-view.h"
++
++struct _NautilusWindowTab
++{
++    AdwBin parent_instance;
++
++    /* Template widgets */
++    GtkPaned *paned;
++
++    /* Start pane (index 0) */
++    GtkWidget *start_box;
++    NautilusWindowSlot *primary_slot;
++
++    /* End pane (index 1) */
++    GtkWidget *end_box;
++    NautilusWindowSlot *secondary_slot;
++    gboolean split_visible;
++
++    guint remembered_pane; /* 0 or 1 */
++    double split_fraction;
++    int paned_span;
++    int paned_width;
++    gboolean setting_position;
++    gboolean user_adjusting;
++    int pending_position;
++
++    char *title;
++    char *tooltip;
++    gboolean loading;
++};
++
++G_DEFINE_TYPE (NautilusWindowTab, nautilus_window_tab, ADW_TYPE_BIN)
++
++static GtkSizeRequestMode
++tab_request_mode (GtkWidget *widget)
++{
++    GtkWidget *child = adw_bin_get_child (ADW_BIN (widget));
++
++    return child != NULL ? gtk_widget_get_request_mode (child) : GTK_SIZE_REQUEST_CONSTANT_SIZE;
++}
++
++static void
++tab_measure (GtkWidget      *widget,
++             GtkOrientation  orientation,
++             int             for_size,
++             int            *minimum,
++             int            *natural,
++             int            *minimum_baseline,
++             int            *natural_baseline)
++{
++    NautilusWindowTab *self = NAUTILUS_WINDOW_TAB (widget);
++    GtkWidget *child = adw_bin_get_child (ADW_BIN (widget));
++
++    *minimum = *natural = 0;
++    if (minimum_baseline != NULL)
++    {
++        *minimum_baseline = -1;
++    }
++    if (natural_baseline != NULL)
++    {
++        *natural_baseline = -1;
++    }
++    if (child == NULL)
++    {
++        return;
++    }
++
++    gtk_widget_measure (child, orientation, for_size, minimum, natural,
++                        minimum_baseline, natural_baseline);
++    if (self->split_visible && orientation == GTK_ORIENTATION_HORIZONTAL)
++    {
++        int start_minimum, end_minimum;
++
++        gtk_widget_measure (self->start_box, orientation, -1, &start_minimum, NULL, NULL, NULL);
++        gtk_widget_measure (self->end_box, orientation, -1, &end_minimum, NULL, NULL, NULL);
++        /* GtkPaned's shrinkable minimum omits the viewports, but the window cannot. */
++        *minimum += MAX (200, start_minimum) + MAX (200, end_minimum);
++        *natural = MAX (*natural, *minimum);
++    }
++}
++
++static void
++tab_allocate (GtkWidget *widget,
++              int        width,
++              int        height,
++              int        baseline)
++{
++    GtkWidget *child = adw_bin_get_child (ADW_BIN (widget));
++
++    if (child != NULL)
++    {
++        gtk_widget_allocate (child, width, height, baseline, NULL);
++    }
++}
++
++enum
++{
++    PROP_0,
++    PROP_TITLE,
++    PROP_TOOLTIP,
++    PROP_LOADING,
++    N_PROPERTIES
++};
++
++static GParamSpec *properties[N_PROPERTIES] = { NULL, };
++
++enum
++{
++    ACTIVATE_SLOT,
++    UNROOTING,
++    N_SIGNALS
++};
++
++static guint signals[N_SIGNALS] = { 0, };
++
++static void update_metadata (NautilusWindowTab *self);
++static void update_styling (NautilusWindowTab *self);
++static void setup_end_pane (NautilusWindowTab *self);
++
++static char *
++get_slot_tooltip_text (NautilusWindowSlot *slot)
++{
++    if (slot == NULL)
++    {
++        return NULL;
++    }
++
++    GFile *location = nautilus_window_slot_get_location (slot);
++    if (location == NULL)
++    {
++        const char *title = nautilus_window_slot_get_title (slot);
++        return g_markup_escape_text (title ? title : _("Loading…"), -1);
++    }
++
++    if (g_file_has_uri_scheme (location, SCHEME_SEARCH))
++    {
++        const char *title = nautilus_window_slot_get_title (slot);
++        return g_markup_escape_text (title ? title : _("Search"), -1);
++    }
++
++    g_autofree char *parse_name = g_file_get_parse_name (location);
++    return g_markup_escape_text (parse_name ? parse_name : "", -1);
++}
++
++static void
++on_slot_title_notify (GObject    *object,
++                      GParamSpec *pspec,
++                      gpointer    user_data)
++{
++    NautilusWindowTab *self = NAUTILUS_WINDOW_TAB (user_data);
++    update_metadata (self);
++}
++
++static void
++on_slot_location_notify (GObject    *object,
++                         GParamSpec *pspec,
++                         gpointer    user_data)
++{
++    NautilusWindowTab *self = NAUTILUS_WINDOW_TAB (user_data);
++    update_metadata (self);
++}
++
++static void
++on_slot_loading_notify (GObject    *object,
++                        GParamSpec *pspec,
++                        gpointer    user_data)
++{
++    NautilusWindowTab *self = NAUTILUS_WINDOW_TAB (user_data);
++    update_metadata (self);
++}
++
++static void
++on_slot_active_notify (GObject    *object,
++                       GParamSpec *pspec,
++                       gpointer    user_data)
++{
++    NautilusWindowTab *self = NAUTILUS_WINDOW_TAB (user_data);
++    update_styling (self);
++}
++
++static void
++connect_slot_signals (NautilusWindowTab  *self,
++                      NautilusWindowSlot *slot)
++{
++    g_signal_connect_object (slot, "notify::title", G_CALLBACK (on_slot_title_notify), self, 0);
++    g_signal_connect_object (slot, "notify::location", G_CALLBACK (on_slot_location_notify), self, 0);
++    g_signal_connect_object (slot, "notify::allow-stop", G_CALLBACK (on_slot_loading_notify), self, 0);
++    g_signal_connect_object (slot, "notify::loading", G_CALLBACK (on_slot_loading_notify), self, 0);
++    g_signal_connect_object (slot, "notify::active", G_CALLBACK (on_slot_active_notify), self, 0);
++}
++
++static void
++disconnect_slot_signals (NautilusWindowTab  *self,
++                         NautilusWindowSlot *slot)
++{
++    if (slot != NULL)
++    {
++        g_signal_handlers_disconnect_by_data (slot, self);
++    }
++}
++
++static void
++update_metadata (NautilusWindowTab *self)
++{
++    gboolean changed_title = FALSE;
++    gboolean changed_tooltip = FALSE;
++    gboolean changed_loading = FALSE;
++
++    /* Title */
++    NautilusWindowSlot *active = nautilus_window_tab_get_remembered_slot (self);
++    const char *slot_title = active ? nautilus_window_slot_get_title (active) : NULL;
++    char *new_title = NULL;
++
++    if (self->split_visible)
++    {
++        new_title = g_strdup_printf (_("%s (Split)"), slot_title ? slot_title : _("Loading…"));
++    }
++    else
++    {
++        new_title = g_strdup (slot_title ? slot_title : _("Loading…"));
++    }
++
++    if (g_strcmp0 (self->title, new_title) != 0)
++    {
++        g_free (self->title);
++        self->title = new_title;
++        changed_title = TRUE;
++    }
++    else
++    {
++        g_free (new_title);
++    }
++
++    /* Tooltip */
++    char *new_tooltip = NULL;
++    if (self->split_visible)
++    {
++        g_autofree char *t1 = get_slot_tooltip_text (self->primary_slot);
++        g_autofree char *t2 = get_slot_tooltip_text (self->secondary_slot);
++        new_tooltip = g_strdup_printf ("%s\n%s", t1 ? t1 : "", t2 ? t2 : "");
++    }
++    else
++    {
++        new_tooltip = get_slot_tooltip_text (active);
++    }
++
++    if (g_strcmp0 (self->tooltip, new_tooltip) != 0)
++    {
++        g_free (self->tooltip);
++        self->tooltip = new_tooltip;
++        changed_tooltip = TRUE;
++    }
++    else
++    {
++        g_free (new_tooltip);
++    }
++
++    /* Loading */
++    gboolean l1 = self->primary_slot ? nautilus_window_slot_get_allow_stop (self->primary_slot) : FALSE;
++    gboolean l2 = self->secondary_slot ? nautilus_window_slot_get_allow_stop (self->secondary_slot) : FALSE;
++    gboolean new_loading = l1 || l2;
++
++    if (self->loading != new_loading)
++    {
++        self->loading = new_loading;
++        changed_loading = TRUE;
++    }
++
++    if (changed_title)
++    {
++        g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_TITLE]);
++    }
++    if (changed_tooltip)
++    {
++        g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_TOOLTIP]);
++    }
++    if (changed_loading)
++    {
++        g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_LOADING]);
++    }
++}
++
++static void
++update_styling (NautilusWindowTab *self)
++{
++    gboolean split = self->split_visible;
++
++    if (split)
++    {
++        gtk_widget_add_css_class (GTK_WIDGET (self), "split-view");
++        gtk_widget_add_css_class (self->start_box, "card");
++        gtk_widget_add_css_class (self->end_box, "card");
++    }
++    else
++    {
++        gtk_widget_remove_css_class (GTK_WIDGET (self), "split-view");
++        gtk_widget_remove_css_class (self->start_box, "card");
++        gtk_widget_remove_css_class (self->start_box, "active-pane");
++        gtk_widget_remove_css_class (self->start_box, "inactive-pane");
++        if (self->end_box != NULL)
++        {
++            gtk_widget_remove_css_class (self->end_box, "card");
++            gtk_widget_remove_css_class (self->end_box, "active-pane");
++            gtk_widget_remove_css_class (self->end_box, "inactive-pane");
++        }
++    }
++
++    if (!split)
++    {
++        if (self->primary_slot != NULL)
++        {
++            gtk_widget_set_opacity (GTK_WIDGET (self->primary_slot), 1.0);
++        }
++        if (self->secondary_slot != NULL)
++        {
++            gtk_widget_set_opacity (GTK_WIDGET (self->secondary_slot), 1.0);
++        }
++        return;
++    }
++
++    gboolean start_active = FALSE;
++    if (self->primary_slot && nautilus_window_slot_get_active (self->primary_slot))
++    {
++        start_active = TRUE;
++    }
++    else if (self->secondary_slot && nautilus_window_slot_get_active (self->secondary_slot))
++    {
++        start_active = FALSE;
++    }
++    else
++    {
++        start_active = (self->remembered_pane == 0);
++    }
++    if (start_active)
++    {
++        gtk_widget_add_css_class (self->start_box, "active-pane");
++        gtk_widget_remove_css_class (self->start_box, "inactive-pane");
++        gtk_widget_remove_css_class (self->end_box, "active-pane");
++        gtk_widget_add_css_class (self->end_box, "inactive-pane");
++    }
++    else
++    {
++        gtk_widget_remove_css_class (self->start_box, "active-pane");
++        gtk_widget_add_css_class (self->start_box, "inactive-pane");
++        gtk_widget_add_css_class (self->end_box, "active-pane");
++        gtk_widget_remove_css_class (self->end_box, "inactive-pane");
++    }
++
++    gtk_widget_set_opacity (GTK_WIDGET (self->primary_slot), start_active ? 1.0 : 0.75);
++    gtk_widget_set_opacity (GTK_WIDGET (self->secondary_slot), start_active ? 0.75 : 1.0);
++}
++
++static void
++constrain_paned_position (GObject           *object,
++                          GParamSpec        *pspec,
++                          NautilusWindowTab *self)
++{
++    int minimum, maximum, start_minimum, end_minimum;
++
++    if (!self->split_visible || self->setting_position)
++    {
++        return;
++    }
++
++    g_object_get (self->paned, "min-position", &minimum, "max-position", &maximum, NULL);
++    if (maximum <= minimum)
++    {
++        return;
++    }
++
++    int width = gtk_widget_get_width (GTK_WIDGET (self->paned));
++    /* GTK can notify position before updating the bounds during allocation. */
++    if (g_str_equal (pspec->name, "position") && self->paned_span > 0 &&
++        width != self->paned_width && maximum - minimum == self->paned_span)
++    {
++        return;
++    }
++
++    gtk_widget_measure (self->start_box, GTK_ORIENTATION_HORIZONTAL, -1,
++                        &start_minimum, NULL, NULL, NULL);
++    gtk_widget_measure (self->end_box, GTK_ORIENTATION_HORIZONTAL, -1,
++                        &end_minimum, NULL, NULL, NULL);
++    start_minimum = MAX (200, start_minimum);
++    end_minimum = MAX (200, end_minimum);
++
++    if (start_minimum + end_minimum > maximum - minimum)
++    {
++        start_minimum = (maximum - minimum) / 2;
++        end_minimum = maximum - minimum - start_minimum;
++    }
++
++    int span = maximum - minimum;
++    int position = gtk_paned_get_position (self->paned);
++    if (self->pending_position >= 0)
++    {
++        self->split_fraction = CLAMP ((double) (self->pending_position - minimum) / span, 0.0, 1.0);
++        self->pending_position = -1;
++    }
++
++    int preferred = minimum + (int) (self->split_fraction * span + 0.5);
++    int bounded = CLAMP (preferred, minimum + start_minimum, maximum - end_minimum);
++    if (self->user_adjusting && span == self->paned_span &&
++        g_str_equal (pspec->name, "position") && position != bounded)
++    {
++        bounded = CLAMP (position, minimum + start_minimum, maximum - end_minimum);
++        self->split_fraction = (double) (bounded - minimum) / span;
++    }
++    self->paned_span = span;
++    self->paned_width = width;
++
++    if (position != bounded)
++    {
++        self->setting_position = TRUE;
++        gtk_paned_set_position (self->paned, bounded);
++        self->setting_position = FALSE;
++    }
++}
++
++static void
++on_divider_pressed (GtkGestureClick   *gesture,
++                    int                n_press,
++                    double             x,
++                    double             y,
++                    NautilusWindowTab *self)
++{
++    GtkWidget *picked = gtk_widget_pick (GTK_WIDGET (self->paned), x, y, GTK_PICK_DEFAULT);
++
++    self->user_adjusting = picked != NULL &&
++                           g_str_equal (gtk_widget_get_css_name (picked), "separator");
++}
++
++static gboolean
++on_divider_event (GtkEventControllerLegacy *controller,
++                  GdkEvent                 *event,
++                  NautilusWindowTab        *self)
++{
++    GdkEventType type = gdk_event_get_event_type (event);
++
++    if (type == GDK_BUTTON_RELEASE || type == GDK_TOUCH_END ||
++        type == GDK_TOUCH_CANCEL)
++    {
++        self->user_adjusting = FALSE;
++    }
++    else if (type == GDK_KEY_RELEASE)
++    {
++        self->user_adjusting = FALSE;
++    }
++    else if (type == GDK_KEY_PRESS)
++    {
++        GtkRoot *root = gtk_widget_get_root (GTK_WIDGET (self));
++        GtkWidget *focus = root != NULL ? gtk_root_get_focus (root) : NULL;
++
++        self->user_adjusting = focus == GTK_WIDGET (self->paned) ||
++                               (focus != NULL &&
++                                gtk_widget_is_ancestor (focus, GTK_WIDGET (self->paned)) &&
++                                g_str_equal (gtk_widget_get_css_name (focus), "separator"));
++    }
++
++    return GDK_EVENT_PROPAGATE;
++}
++
++static void
++activate_clicked_slot (NautilusWindowTab  *self,
++                       NautilusWindowSlot *slot)
++{
++    if (slot != NULL && !nautilus_window_slot_get_active (slot))
++    {
++        g_signal_emit (self, signals[ACTIVATE_SLOT], 0, slot);
++        gtk_widget_grab_focus (GTK_WIDGET (slot));
++    }
++}
++
++static void
++on_start_pane_clicked (GtkGestureClick *gesture,
++                       int              n_press,
++                       double           x,
++                       double           y,
++                       gpointer         user_data)
++{
++    NautilusWindowTab *self = NAUTILUS_WINDOW_TAB (user_data);
++
++    activate_clicked_slot (self, self->primary_slot);
++}
++
++static void
++on_end_pane_clicked (GtkGestureClick *gesture,
++                     int              n_press,
++                     double           x,
++                     double           y,
++                     gpointer         user_data)
++{
++    NautilusWindowTab *self = NAUTILUS_WINDOW_TAB (user_data);
++
++    activate_clicked_slot (self, self->secondary_slot);
++}
++
++static gboolean
++is_editable_widget (GtkWidget *widget)
++{
++    for (GtkWidget *curr = widget; curr != NULL; curr = gtk_widget_get_parent (curr))
++    {
++        if (GTK_IS_EDITABLE (curr) || GTK_IS_TEXT_VIEW (curr))
++        {
++            return TRUE;
++        }
++    }
++    return FALSE;
++}
++
++static void
++on_start_focus_enter (GtkEventControllerFocus *controller,
++                      gpointer                 user_data)
++{
++    NautilusWindowTab *self = NAUTILUS_WINDOW_TAB (user_data);
++
++    if (self->primary_slot != NULL)
++    {
++        g_signal_emit (self, signals[ACTIVATE_SLOT], 0, self->primary_slot);
++    }
++}
++
++static void
++on_end_focus_enter (GtkEventControllerFocus *controller,
++                    gpointer                 user_data)
++{
++    NautilusWindowTab *self = NAUTILUS_WINDOW_TAB (user_data);
++
++    if (self->secondary_slot != NULL)
++    {
++        g_signal_emit (self, signals[ACTIVATE_SLOT], 0, self->secondary_slot);
++    }
++}
++
++static gboolean
++on_key_pressed (GtkEventControllerKey *controller,
++                guint                  keyval,
++                guint                  keycode,
++                GdkModifierType        state,
++                gpointer               user_data)
++{
++    NautilusWindowTab *self = NAUTILUS_WINDOW_TAB (user_data);
++
++    if (!self->split_visible)
++    {
++        return GDK_EVENT_PROPAGATE;
++    }
++
++    if (keyval != GDK_KEY_Tab && keyval != GDK_KEY_ISO_Left_Tab && keyval != GDK_KEY_KP_Tab)
++    {
++        return GDK_EVENT_PROPAGATE;
++    }
++
++    if (state & (GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SUPER_MASK))
++    {
++        return GDK_EVENT_PROPAGATE;
++    }
++
++    GtkRoot *root = gtk_widget_get_root (GTK_WIDGET (self));
++    if (root == NULL)
++    {
++        return GDK_EVENT_PROPAGATE;
++    }
++
++    GtkWidget *focus = gtk_root_get_focus (root);
++    if (focus == NULL || !gtk_widget_is_ancestor (focus, GTK_WIDGET (self)))
++    {
++        return GDK_EVENT_PROPAGATE;
++    }
++
++    if (is_editable_widget (focus))
++    {
++        return GDK_EVENT_PROPAGATE;
++    }
++
++    if (gtk_widget_get_ancestor (focus, GTK_TYPE_POPOVER) != NULL ||
++        gtk_widget_get_ancestor (focus, GTK_TYPE_DIALOG) != NULL ||
++        gtk_widget_get_ancestor (focus, ADW_TYPE_DIALOG) != NULL)
++    {
++        return GDK_EVENT_PROPAGATE;
++    }
++
++    /* Check file canvas ancestry (list view, grid view, column view, including grouped grid) */
++    gboolean is_canvas = (GTK_IS_LIST_VIEW (focus) ||
++                          GTK_IS_GRID_VIEW (focus) ||
++                          GTK_IS_COLUMN_VIEW (focus) ||
++                          NAUTILUS_IS_GRID_VIEW (focus) ||
++                          gtk_widget_get_ancestor (focus, GTK_TYPE_LIST_VIEW) != NULL ||
++                          gtk_widget_get_ancestor (focus, GTK_TYPE_GRID_VIEW) != NULL ||
++                          gtk_widget_get_ancestor (focus, GTK_TYPE_COLUMN_VIEW) != NULL);
++
++    if (!is_canvas)
++    {
++        return GDK_EVENT_PROPAGATE;
++    }
++
++    NautilusWindowSlot *target = NULL;
++    if (self->primary_slot != NULL && gtk_widget_is_ancestor (focus, GTK_WIDGET (self->primary_slot)))
++    {
++        target = self->secondary_slot;
++    }
++    else if (self->secondary_slot != NULL && gtk_widget_is_ancestor (focus, GTK_WIDGET (self->secondary_slot)))
++    {
++        target = self->primary_slot;
++    }
++
++    if (target != NULL)
++    {
++        g_signal_emit (self, signals[ACTIVATE_SLOT], 0, target);
++        gtk_widget_grab_focus (GTK_WIDGET (target));
++        return GDK_EVENT_STOP;
++    }
++
++    return GDK_EVENT_PROPAGATE;
++}
++
++static void
++setup_end_pane (NautilusWindowTab *self)
++{
++    if (self->end_box != NULL)
++    {
++        return;
++    }
++
++    self->end_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
++    gtk_widget_set_hexpand (self->end_box, TRUE);
++    gtk_widget_set_vexpand (self->end_box, TRUE);
++    gtk_widget_set_size_request (self->end_box, 0, 0);
++    gtk_widget_set_overflow (self->end_box, GTK_OVERFLOW_HIDDEN);
++    gtk_widget_add_css_class (self->end_box, "split-pane");
++
++    GtkGesture *click = gtk_gesture_click_new ();
++    gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), 0);
++    gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (click), GTK_PHASE_CAPTURE);
++    g_signal_connect_object (click, "pressed", G_CALLBACK (on_end_pane_clicked), self, 0);
++    gtk_widget_add_controller (self->end_box, GTK_EVENT_CONTROLLER (click));
++
++    GtkEventController *focus = gtk_event_controller_focus_new ();
++    g_signal_connect_object (focus, "enter", G_CALLBACK (on_end_focus_enter), self, 0);
++    gtk_widget_add_controller (self->end_box, focus);
++}
++
++static void
++nautilus_window_tab_unroot (GtkWidget *widget)
++{
++    NautilusWindowTab *self = NAUTILUS_WINDOW_TAB (widget);
++
++    self->user_adjusting = FALSE;
++    g_signal_emit (self, signals[UNROOTING], 0);
++
++    GTK_WIDGET_CLASS (nautilus_window_tab_parent_class)->unroot (widget);
++}
++
++static void
++nautilus_window_tab_get_property (GObject    *object,
++                                  guint       prop_id,
++                                  GValue     *value,
++                                  GParamSpec *pspec)
++{
++    NautilusWindowTab *self = NAUTILUS_WINDOW_TAB (object);
++
++    switch (prop_id)
++    {
++        case PROP_TITLE:
++        {
++            g_value_set_string (value, self->title);
++        }
++        break;
++
++        case PROP_TOOLTIP:
++        {
++            g_value_set_string (value, self->tooltip);
++        }
++        break;
++
++        case PROP_LOADING:
++        {
++            g_value_set_boolean (value, self->loading);
++        }
++        break;
++
++        default:
++        {
++            G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
++        }
++        break;
++    }
++}
++
++static void
++nautilus_window_tab_dispose (GObject *object)
++{
++    NautilusWindowTab *self = NAUTILUS_WINDOW_TAB (object);
++
++    if (self->primary_slot != NULL)
++    {
++        disconnect_slot_signals (self, self->primary_slot);
++        self->primary_slot = NULL;
++    }
++
++    if (self->secondary_slot != NULL)
++    {
++        disconnect_slot_signals (self, self->secondary_slot);
++        self->secondary_slot = NULL;
++    }
++
++    if (self->paned != NULL)
++    {
++        g_signal_handlers_disconnect_by_data (self->paned, self);
++    }
++
++    self->end_box = NULL;
++
++    adw_bin_set_child (ADW_BIN (self), NULL);
++    gtk_widget_dispose_template (GTK_WIDGET (self), NAUTILUS_TYPE_WINDOW_TAB);
++
++    G_OBJECT_CLASS (nautilus_window_tab_parent_class)->dispose (object);
++}
++
++static void
++nautilus_window_tab_finalize (GObject *object)
++{
++    NautilusWindowTab *self = NAUTILUS_WINDOW_TAB (object);
++
++    g_clear_pointer (&self->title, g_free);
++    g_clear_pointer (&self->tooltip, g_free);
++
++    G_OBJECT_CLASS (nautilus_window_tab_parent_class)->finalize (object);
++}
++
++static void
++nautilus_window_tab_class_init (NautilusWindowTabClass *klass)
++{
++    GObjectClass *object_class = G_OBJECT_CLASS (klass);
++    GtkWidgetClass *widget_class = GTK_WIDGET_CLASS (klass);
++
++    object_class->dispose = nautilus_window_tab_dispose;
++    object_class->finalize = nautilus_window_tab_finalize;
++    object_class->get_property = nautilus_window_tab_get_property;
++
++    widget_class->unroot = nautilus_window_tab_unroot;
++
++    properties[PROP_TITLE] =
++        g_param_spec_string ("title",
++                             "Title",
++                             "The title of the tab",
++                             NULL,
++                             G_PARAM_READABLE | G_PARAM_STATIC_STRINGS);
++
++    properties[PROP_TOOLTIP] =
++        g_param_spec_string ("tooltip",
++                             "Tooltip",
++                             "The tooltip of the tab",
++                             NULL,
++                             G_PARAM_READABLE | G_PARAM_STATIC_STRINGS);
++
++    properties[PROP_LOADING] =
++        g_param_spec_boolean ("loading",
++                              "Loading",
++                              "Whether either slot in the tab is loading",
++                              FALSE,
++                              G_PARAM_READABLE | G_PARAM_STATIC_STRINGS);
++
++    g_object_class_install_properties (object_class, N_PROPERTIES, properties);
++
++    signals[ACTIVATE_SLOT] =
++        g_signal_new ("activate-slot",
++                      G_TYPE_FROM_CLASS (klass),
++                      G_SIGNAL_RUN_LAST,
++                      0,
++                      NULL, NULL,
++                      g_cclosure_marshal_VOID__OBJECT,
++                      G_TYPE_NONE, 1,
++                      NAUTILUS_TYPE_WINDOW_SLOT);
++
++    signals[UNROOTING] =
++        g_signal_new ("unrooting",
++                      G_TYPE_FROM_CLASS (klass),
++                      G_SIGNAL_RUN_LAST,
++                      0,
++                      NULL, NULL,
++                      g_cclosure_marshal_VOID__VOID,
++                      G_TYPE_NONE, 0);
++
++    gtk_widget_class_set_template_from_resource (widget_class,
++                                                 "/org/gnome/nautilus/ui/nautilus-window-tab.ui");
++
++    gtk_widget_class_bind_template_child (widget_class, NautilusWindowTab, paned);
++    gtk_widget_class_bind_template_child (widget_class, NautilusWindowTab, start_box);
++}
++
++static void
++nautilus_window_tab_init (NautilusWindowTab *self)
++{
++    gtk_widget_init_template (GTK_WIDGET (self));
++    gtk_widget_add_css_class (GTK_WIDGET (self), "nautilus-window-tab");
++    gtk_widget_set_layout_manager (GTK_WIDGET (self),
++                                   gtk_custom_layout_new (tab_request_mode, tab_measure, tab_allocate));
++
++    self->remembered_pane = 0;
++
++    /* Click activation on start pane */
++    GtkGesture *click = gtk_gesture_click_new ();
++    gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), 0);
++    gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (click), GTK_PHASE_CAPTURE);
++    g_signal_connect_object (click, "pressed", G_CALLBACK (on_start_pane_clicked), self, 0);
++    gtk_widget_add_controller (self->start_box, GTK_EVENT_CONTROLLER (click));
++
++    /* Focus activation on start pane */
++    GtkEventController *focus = gtk_event_controller_focus_new ();
++    g_signal_connect_object (focus, "enter", G_CALLBACK (on_start_focus_enter), self, 0);
++    gtk_widget_add_controller (self->start_box, focus);
++
++    /* Contextual Tab key handler */
++    GtkEventController *key = gtk_event_controller_key_new ();
++    gtk_event_controller_set_propagation_phase (key, GTK_PHASE_CAPTURE);
++    g_signal_connect_object (key, "key-pressed", G_CALLBACK (on_key_pressed), self, 0);
++    gtk_widget_add_controller (GTK_WIDGET (self), key);
++
++    g_signal_connect_object (self->paned, "notify::position",
++                             G_CALLBACK (constrain_paned_position), self, 0);
++    g_signal_connect_object (self->paned, "notify::min-position",
++                             G_CALLBACK (constrain_paned_position), self, 0);
++    g_signal_connect_object (self->paned, "notify::max-position",
++                             G_CALLBACK (constrain_paned_position), self, 0);
++
++    GtkGesture *divider_click = gtk_gesture_click_new ();
++    gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (divider_click), GDK_BUTTON_PRIMARY);
++    gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (divider_click), GTK_PHASE_CAPTURE);
++    g_signal_connect_object (divider_click, "pressed", G_CALLBACK (on_divider_pressed), self, 0);
++    gtk_widget_add_controller (GTK_WIDGET (self->paned), GTK_EVENT_CONTROLLER (divider_click));
++
++    GtkEventController *divider_events = gtk_event_controller_legacy_new ();
++    gtk_event_controller_set_propagation_phase (divider_events, GTK_PHASE_CAPTURE);
++    g_signal_connect_object (divider_events, "event", G_CALLBACK (on_divider_event), self, 0);
++    gtk_widget_add_controller (GTK_WIDGET (self->paned), divider_events);
++
++}
++
++NautilusWindowTab *
++nautilus_window_tab_new (NautilusWindowSlot *primary_slot)
++{
++    g_return_val_if_fail (NAUTILUS_IS_WINDOW_SLOT (primary_slot), NULL);
++
++    NautilusWindowTab *self = g_object_new (NAUTILUS_TYPE_WINDOW_TAB, NULL);
++
++    self->primary_slot = primary_slot;
++    gtk_box_append (GTK_BOX (self->start_box), GTK_WIDGET (primary_slot));
++    connect_slot_signals (self, primary_slot);
++
++    update_styling (self);
++    update_metadata (self);
++
++    return self;
++}
++
++NautilusWindowSlot *
++nautilus_window_tab_get_slot (NautilusWindowTab *self,
++                              guint              index)
++{
++    g_return_val_if_fail (NAUTILUS_IS_WINDOW_TAB (self), NULL);
++
++    if (index == 0)
++    {
++        return self->primary_slot;
++    }
++    if (index == 1)
++    {
++        return self->secondary_slot;
++    }
++
++    return NULL;
++}
++
++NautilusWindowSlot *
++nautilus_window_tab_get_remembered_slot (NautilusWindowTab *self)
++{
++    g_return_val_if_fail (NAUTILUS_IS_WINDOW_TAB (self), NULL);
++
++    if (self->remembered_pane == 1 && self->secondary_slot != NULL)
++    {
++        return self->secondary_slot;
++    }
++
++    return self->primary_slot;
++}
++
++void
++nautilus_window_tab_remember_slot (NautilusWindowTab  *self,
++                                   NautilusWindowSlot *slot)
++{
++    g_return_if_fail (NAUTILUS_IS_WINDOW_TAB (self));
++    g_return_if_fail (NAUTILUS_IS_WINDOW_SLOT (slot));
++
++    if (slot == self->primary_slot)
++    {
++        self->remembered_pane = 0;
++    }
++    else if (slot == self->secondary_slot)
++    {
++        self->remembered_pane = 1;
++    }
++    else
++    {
++        g_warning ("Slot does not belong to NautilusWindowTab");
++        return;
++    }
++
++    update_styling (self);
++    update_metadata (self);
++}
++
++void
++nautilus_window_tab_add_secondary (NautilusWindowTab  *self,
++                                   NautilusWindowSlot *slot)
++{
++    g_return_if_fail (NAUTILUS_IS_WINDOW_TAB (self));
++    g_return_if_fail (NAUTILUS_IS_WINDOW_SLOT (slot));
++    g_return_if_fail (self->secondary_slot == NULL);
++
++    self->secondary_slot = slot;
++    self->split_visible = TRUE;
++    self->split_fraction = 0.5;
++    self->paned_span = 0;
++    self->paned_width = 0;
++    self->pending_position = -1;
++    self->user_adjusting = FALSE;
++    setup_end_pane (self);
++
++    gtk_box_append (GTK_BOX (self->end_box), GTK_WIDGET (slot));
++    gtk_paned_set_end_child (self->paned, self->end_box);
++
++    connect_slot_signals (self, slot);
++
++    /* Initialize once; allocation changes scale the user's divider proportion. */
++    int width = gtk_widget_get_width (GTK_WIDGET (self->paned));
++    gtk_paned_set_position (self->paned, width > 0 ? width / 2 : -1);
++
++    update_styling (self);
++    update_metadata (self);
++}
++
++void
++nautilus_window_tab_remove_slot (NautilusWindowTab  *self,
++                                 NautilusWindowSlot *slot)
++{
++    g_return_if_fail (NAUTILUS_IS_WINDOW_TAB (self));
++    g_return_if_fail (self->secondary_slot != NULL);
++    g_return_if_fail (slot == self->primary_slot || slot == self->secondary_slot);
++
++    disconnect_slot_signals (self, slot);
++
++    if (slot == self->primary_slot)
++    {
++        NautilusWindowSlot *survivor = self->secondary_slot;
++        g_object_ref (survivor);
++
++        gtk_box_remove (GTK_BOX (self->end_box), GTK_WIDGET (survivor));
++        gtk_box_remove (GTK_BOX (self->start_box), GTK_WIDGET (slot));
++        gtk_box_append (GTK_BOX (self->start_box), GTK_WIDGET (survivor));
++
++        self->primary_slot = survivor;
++        self->secondary_slot = NULL;
++
++        gtk_paned_set_end_child (self->paned, NULL);
++        g_object_unref (survivor);
++    }
++    else
++    {
++        gtk_box_remove (GTK_BOX (self->end_box), GTK_WIDGET (slot));
++        self->secondary_slot = NULL;
++        gtk_paned_set_end_child (self->paned, NULL);
++    }
++
++    self->end_box = NULL;
++    self->split_visible = FALSE;
++    gtk_widget_set_visible (self->start_box, TRUE);
++    self->remembered_pane = 0;
++
++    update_styling (self);
++    update_metadata (self);
++}
++
++gboolean
++nautilus_window_tab_is_split (NautilusWindowTab *self)
++{
++    g_return_val_if_fail (NAUTILUS_IS_WINDOW_TAB (self), FALSE);
++
++    return self->split_visible;
++}
++
++void
++nautilus_window_tab_set_split_visible (NautilusWindowTab *self,
++                                       gboolean           visible)
++{
++    g_return_if_fail (NAUTILUS_IS_WINDOW_TAB (self));
++    g_return_if_fail (self->secondary_slot != NULL);
++
++    self->split_visible = visible;
++    gtk_widget_set_visible (self->start_box, visible || self->remembered_pane == 0);
++    gtk_widget_set_visible (self->end_box, visible || self->remembered_pane == 1);
++    gtk_widget_queue_resize (GTK_WIDGET (self));
++    update_styling (self);
++    update_metadata (self);
++}
++
++int
++nautilus_window_tab_get_position (NautilusWindowTab *self)
++{
++    g_return_val_if_fail (NAUTILUS_IS_WINDOW_TAB (self), 0);
++
++    return gtk_paned_get_position (self->paned);
++}
++
++void
++nautilus_window_tab_set_position (NautilusWindowTab *self,
++                                  int                position)
++{
++    g_return_if_fail (NAUTILUS_IS_WINDOW_TAB (self));
++
++    self->pending_position = position;
++
++    gtk_paned_set_position (self->paned, position);
++    if (self->pending_position >= 0)
++    {
++        constrain_paned_position (G_OBJECT (self->paned),
++                                  g_object_class_find_property (G_OBJECT_GET_CLASS (self->paned), "position"),
++                                  self);
++    }
++}
+diff --git a/src/nautilus-window-tab.h b/src/nautilus-window-tab.h
+new file mode 100644
+index 0000000..af4d69b
+--- /dev/null
++++ b/src/nautilus-window-tab.h
+@@ -0,0 +1,56 @@
++/*
++ * nautilus-window-tab.h: Tab wrapper widget for Nautilus dual pane architecture
++ *
++ * Copyright (C) 2026 The Nautilus Extended Authors
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://www.gnu.org/licenses/>.
++ */
++
++#pragma once
++
++#include <adwaita.h>
++#include <gtk/gtk.h>
++
++#include "nautilus-window-slot.h"
++
++G_BEGIN_DECLS
++
++#define NAUTILUS_TYPE_WINDOW_TAB (nautilus_window_tab_get_type ())
++G_DECLARE_FINAL_TYPE (NautilusWindowTab, nautilus_window_tab, NAUTILUS, WINDOW_TAB, AdwBin)
++
++NautilusWindowTab  *nautilus_window_tab_new                  (NautilusWindowSlot *primary_slot);
++
++NautilusWindowSlot *nautilus_window_tab_get_slot             (NautilusWindowTab  *self,
++                                                              guint               index);
++
++NautilusWindowSlot *nautilus_window_tab_get_remembered_slot  (NautilusWindowTab  *self);
++
++void                nautilus_window_tab_remember_slot        (NautilusWindowTab  *self,
++                                                              NautilusWindowSlot *slot);
++
++void                nautilus_window_tab_add_secondary        (NautilusWindowTab  *self,
++                                                              NautilusWindowSlot *slot);
++
++void                nautilus_window_tab_remove_slot           (NautilusWindowTab  *self,
++                                                              NautilusWindowSlot *slot);
++
++gboolean            nautilus_window_tab_is_split             (NautilusWindowTab  *self);
++void                nautilus_window_tab_set_split_visible    (NautilusWindowTab  *self,
++                                                              gboolean            visible);
++
++int                 nautilus_window_tab_get_position         (NautilusWindowTab  *self);
++void                nautilus_window_tab_set_position         (NautilusWindowTab  *self,
++                                                              int                 position);
++
++G_END_DECLS
+diff --git a/src/nautilus-window.c b/src/nautilus-window.c
+index 4ca67af..9e290bb 100644
+--- a/src/nautilus-window.c
++++ b/src/nautilus-window.c
+@@ -68,14 +68,30 @@
+ #include "nautilus-trash-monitor.h"
+ #include "nautilus-ui-utilities.h"
+ #include "nautilus-window-slot.h"
++#include "nautilus-window-tab.h"
++
++typedef struct
++{
++    NautilusNavigationState *primary_state;
++    NautilusNavigationState *secondary_state;
++    gboolean split_visible;
++    guint remembered_pane;
++    int position;
++} ClosedTabState;
+ 
+ static void nautilus_window_initialize_actions (NautilusWindow *window);
+ static void nautilus_window_sync_location_widgets (NautilusWindow *window);
+ static void update_cursor (NautilusWindow *window);
+-static void
+-set_active_slot (NautilusWindow     *window,
+-                 NautilusWindowSlot *new_slot);
+-
++static void update_split_action_state (NautilusWindow *window);
++static void nautilus_window_close_pane (NautilusWindow     *window,
++                                       NautilusWindowTab  *tab,
++                                       NautilusWindowSlot *victim);
++static void set_active_slot (NautilusWindow     *window,
++                             NautilusWindowSlot *new_slot);
++static void connect_slot (NautilusWindow     *window,
++                          NautilusWindowSlot *slot);
++static void remove_slot_from_window (NautilusWindowSlot *slot,
++                                     NautilusWindow     *window);
+ /* Sanity check: highest mouse button value I could find was 14. 5 is our
+  * lower threshold (well-documented to be the one of the button events for the
+  * scrollwheel), so it's hardcoded in the functions below. However, if you have
+@@ -97,7 +113,8 @@ struct _NautilusWindow
+ 
+     GList *slots;
+     NautilusWindowSlot *active_slot; /* weak reference */
+-
++    gboolean in_set_active_slot;
++    int single_pane_min_width;
+     GtkWidget *split_view;
+ 
+     /* Side Pane */
+@@ -197,10 +214,54 @@ static void
+ action_close_current_view (GSimpleAction *action,
+                            GVariant      *state,
+                            gpointer       user_data)
++{
++    NautilusWindow *window = user_data;
++    AdwTabPage *page = adw_tab_view_get_selected_page (window->tab_view);
++
++    if (page == NULL)
++    {
++        return;
++    }
++
++    NautilusWindowTab *tab = NAUTILUS_WINDOW_TAB (adw_tab_page_get_child (page));
++
++    if (tab != NULL && nautilus_window_tab_is_split (tab))
++    {
++        NautilusWindowSlot *victim = window->active_slot;
++        if (victim == NULL || !gtk_widget_is_ancestor (GTK_WIDGET (victim), GTK_WIDGET (tab)))
++        {
++            victim = nautilus_window_tab_get_remembered_slot (tab);
++        }
++        if (victim == NULL)
++        {
++            victim = nautilus_window_tab_get_slot (tab, 0);
++        }
++        nautilus_window_close_pane (window, tab, victim);
++        return;
++    }
++
++    if (adw_tab_view_get_n_pages (window->tab_view) <= 1)
++    {
++        nautilus_window_close (window);
++        return;
++    }
++
++    adw_tab_view_close_page (window->tab_view, page);
++}
++
++static void
++action_close_tab (GSimpleAction *action,
++                  GVariant      *state,
++                  gpointer       user_data)
+ {
+     NautilusWindow *window = user_data;
+     AdwTabPage *page = get_current_page (window);
+ 
++    if (page == NULL)
++    {
++        return;
++    }
++
+     if (adw_tab_view_get_n_pages (window->tab_view) <= 1)
+     {
+         nautilus_window_close (window);
+@@ -210,6 +271,104 @@ action_close_current_view (GSimpleAction *action,
+     adw_tab_view_close_page (window->tab_view, page);
+ }
+ 
++static void
++action_toggle_split (GSimpleAction *action,
++                     GVariant      *parameter,
++                     gpointer       user_data)
++{
++    NautilusWindow *window = user_data;
++    AdwTabPage *page = adw_tab_view_get_selected_page (window->tab_view);
++
++    if (page == NULL)
++    {
++        return;
++    }
++
++    NautilusWindowTab *tab = NAUTILUS_WINDOW_TAB (adw_tab_page_get_child (page));
++    if (tab == NULL)
++    {
++        return;
++    }
++
++    if (nautilus_window_tab_is_split (tab))
++    {
++        NautilusWindowSlot *active = window->active_slot;
++        if (active == NULL || !gtk_widget_is_ancestor (GTK_WIDGET (active), GTK_WIDGET (tab)))
++        {
++            active = nautilus_window_tab_get_remembered_slot (tab);
++        }
++        nautilus_window_tab_remember_slot (tab, active);
++        nautilus_window_tab_set_split_visible (tab, FALSE);
++    }
++    else if (nautilus_window_tab_get_slot (tab, 1) != NULL)
++    {
++        nautilus_window_tab_set_split_visible (tab, TRUE);
++    }
++    else
++    {
++        /* Open second pane and focus it */
++        g_autoptr (GFile) location = g_file_new_for_path (g_get_home_dir ());
++
++        g_autoptr (NautilusWindowSlot) new_slot = nautilus_window_slot_new (NAUTILUS_MODE_BROWSE);
++        connect_slot (window, new_slot);
++        window->slots = g_list_append (window->slots, new_slot);
++
++        nautilus_window_tab_add_secondary (tab, new_slot);
++
++        nautilus_window_slot_open_location_full (new_slot, location, NULL);
++
++        set_active_slot (window, new_slot);
++        gtk_widget_grab_focus (GTK_WIDGET (new_slot));
++    }
++
++    update_split_action_state (window);
++    g_signal_emit (window, signals[LOCATIONS_CHANGED], 0);
++}
++
++static void
++action_switch_pane (GSimpleAction *action,
++                    GVariant      *parameter,
++                    gpointer       user_data)
++{
++    NautilusWindow *window = user_data;
++    AdwTabPage *page = adw_tab_view_get_selected_page (window->tab_view);
++
++    if (page == NULL)
++    {
++        return;
++    }
++
++    NautilusWindowTab *tab = NAUTILUS_WINDOW_TAB (adw_tab_page_get_child (page));
++    if (tab == NULL || !nautilus_window_tab_is_split (tab))
++    {
++        return;
++    }
++
++    NautilusWindowSlot *slot0 = nautilus_window_tab_get_slot (tab, 0);
++    NautilusWindowSlot *slot1 = nautilus_window_tab_get_slot (tab, 1);
++    NautilusWindowSlot *target = NULL;
++
++    if (window->active_slot == slot0)
++    {
++        target = slot1;
++    }
++    else if (window->active_slot == slot1)
++    {
++        target = slot0;
++    }
++    else
++    {
++        NautilusWindowSlot *rem = nautilus_window_tab_get_remembered_slot (tab);
++        target = (rem == slot0) ? slot1 : slot0;
++    }
++
++    if (target != NULL)
++    {
++        set_active_slot (window, target);
++        gtk_widget_grab_focus (GTK_WIDGET (target));
++    }
++}
++
+ static void
+ action_close_other_tabs (GSimpleAction *action,
+                          GVariant      *parameters,
+@@ -372,6 +531,8 @@ tab_view_setup_menu_cb (AdwTabView     *tab_view,
+                                                           "close-other-tabs");
+     move_tab_to_new_window_action = g_action_map_lookup_action (G_ACTION_MAP (window),
+                                                                 "tab-move-new-window");
++    GAction *close_tab_action = g_action_map_lookup_action (G_ACTION_MAP (window),
++                                                            "close-tab");
+ 
+     g_simple_action_set_enabled (G_SIMPLE_ACTION (move_tab_left_action),
+                                  menu_is_closed || position > 0);
+@@ -383,6 +544,10 @@ tab_view_setup_menu_cb (AdwTabView     *tab_view,
+                                  menu_is_closed || n_pages > 1);
+     g_simple_action_set_enabled (G_SIMPLE_ACTION (move_tab_to_new_window_action),
+                                  menu_is_closed || n_pages > 1);
++    if (close_tab_action != NULL)
++    {
++        g_simple_action_set_enabled (G_SIMPLE_ACTION (close_tab_action), TRUE);
++    }
+ }
+ 
+ static void
+@@ -390,8 +555,27 @@ tab_view_notify_selected_page_cb (AdwTabView     *tab_view,
+                                   GParamSpec     *pspec,
+                                   NautilusWindow *window)
+ {
++    if (window->in_set_active_slot)
++    {
++        return;
++    }
++
+     AdwTabPage *page = adw_tab_view_get_selected_page (tab_view);
+-    NautilusWindowSlot *slot = NAUTILUS_WINDOW_SLOT (adw_tab_page_get_child (page));
++    if (page == NULL)
++    {
++        set_active_slot (window, NULL);
++        update_split_action_state (window);
++        return;
++    }
++
++    NautilusWindowTab *tab = NAUTILUS_WINDOW_TAB (adw_tab_page_get_child (page));
++    g_return_if_fail (tab != NULL);
++
++    NautilusWindowSlot *slot = nautilus_window_tab_get_remembered_slot (tab);
++    if (slot == NULL)
++    {
++        slot = nautilus_window_tab_get_slot (tab, 0);
++    }
+ 
+     g_return_if_fail (slot != NULL);
+ 
+@@ -406,58 +590,170 @@ disconnect_slot (NautilusWindow     *window,
+ }
+ 
+ static void
+-on_update_page_tooltip (NautilusWindowSlot *slot,
+-                        GParamSpec         *pspec,
+-                        AdwTabPage         *page)
++connect_slot (NautilusWindow     *window,
++              NautilusWindowSlot *slot)
+ {
+-    GFile *location = nautilus_window_slot_get_location (slot);
+-    g_autofree char *escaped_name = NULL;
++    g_signal_connect_swapped (slot, "notify::allow-stop",
++                              G_CALLBACK (update_cursor), window);
++    g_signal_connect (slot, "notify::location",
++                      G_CALLBACK (on_slot_location_changed), window);
++}
+ 
+-    if (location == NULL)
++static void
++on_tab_activate_slot (NautilusWindowTab   *tab,
++                      NautilusWindowSlot  *slot,
++                      NautilusWindow      *window)
++{
++    set_active_slot (window, slot);
++}
++
++static void
++on_tab_unrooting (NautilusWindowTab *tab,
++                  NautilusWindow    *window)
++{
++    if (window->active_slot != NULL &&
++        gtk_widget_is_ancestor (GTK_WIDGET (window->active_slot), GTK_WIDGET (tab)))
++    {
++        set_active_slot (window, NULL);
++    }
++}
++
++static void
++on_tab_loading_changed (NautilusWindowTab *tab,
++                        GParamSpec        *pspec,
++                        NautilusWindow    *window)
++{
++    update_split_action_state (window);
++}
++
++static void
++update_split_action_state (NautilusWindow *window)
++{
++    GAction *split_action = g_action_map_lookup_action (G_ACTION_MAP (window), "toggle-split");
++    GAction *switch_action = g_action_map_lookup_action (G_ACTION_MAP (window), "switch-pane");
++    AdwTabPage *page = adw_tab_view_get_selected_page (window->tab_view);
++    gboolean is_split = FALSE;
++    int minimum_width = window->single_pane_min_width;
++
++    if (page != NULL)
++    {
++        NautilusWindowTab *tab = NAUTILUS_WINDOW_TAB (adw_tab_page_get_child (page));
++        if (tab != NULL)
++        {
++            is_split = nautilus_window_tab_is_split (tab);
++            if (is_split)
++            {
++                int tab_minimum;
++
++                gtk_widget_measure (GTK_WIDGET (tab), GTK_ORIENTATION_HORIZONTAL, -1,
++                                    &tab_minimum, NULL, NULL, NULL);
++                minimum_width = MAX (minimum_width, tab_minimum);
++            }
++        }
++    }
++
++    /* AdwWindow breakpoints otherwise discard the tab's measured minimum. */
++    int minimum_height;
++    gtk_widget_get_size_request (GTK_WIDGET (window), NULL, &minimum_height);
++    gtk_widget_set_size_request (GTK_WIDGET (window), minimum_width, minimum_height);
++
++    if (split_action != NULL)
++    {
++        g_simple_action_set_state (G_SIMPLE_ACTION (split_action),
++                                   g_variant_new_boolean (is_split));
++    }
++    if (switch_action != NULL)
++    {
++        g_simple_action_set_enabled (G_SIMPLE_ACTION (switch_action), is_split);
++    }
++}
++
++static void
++nautilus_window_close_pane (NautilusWindow     *window,
++                            NautilusWindowTab  *tab,
++                            NautilusWindowSlot *victim)
++{
++    g_return_if_fail (NAUTILUS_IS_WINDOW (window));
++    g_return_if_fail (NAUTILUS_IS_WINDOW_TAB (tab));
++    g_return_if_fail (NAUTILUS_IS_WINDOW_SLOT (victim));
++
++    if (!nautilus_window_tab_is_split (tab))
+     {
+         return;
+     }
+ 
+-    /* Set the tooltip on the label's parent (the tab label hbox),
+-     * so it covers all of the tab label.
+-     */
++    NautilusWindowSlot *slot0 = nautilus_window_tab_get_slot (tab, 0);
++    NautilusWindowSlot *slot1 = nautilus_window_tab_get_slot (tab, 1);
++    NautilusWindowSlot *survivor = (victim == slot0) ? slot1 : slot0;
++
++    g_return_if_fail (survivor != NULL);
++
++    g_object_ref (victim);
++    g_object_ref (survivor);
++
++    GtkWidget *focus = gtk_root_get_focus (GTK_ROOT (window));
++    gboolean refocus_survivor = window->active_slot == victim ||
++                               (focus != NULL &&
++                                gtk_widget_is_ancestor (focus, GTK_WIDGET (tab)));
+ 
+-    if (g_file_has_uri_scheme (location, SCHEME_SEARCH))
++    if (refocus_survivor)
+     {
+-        escaped_name = g_markup_escape_text (nautilus_window_slot_get_title (slot), -1);
++        /* Invalidate the focus chain while its ancestors are still parented. */
++        gtk_root_set_focus (GTK_ROOT (window), NULL);
+     }
+-    else
++
++    if (window->active_slot == victim)
+     {
+-        g_autofree gchar *location_name = g_file_get_parse_name (location);
+-        escaped_name = g_markup_escape_text (location_name, -1);
++        set_active_slot (window, survivor);
+     }
+ 
+-    adw_tab_page_set_tooltip (page, escaped_name);
++    remove_slot_from_window (victim, window);
++    nautilus_window_tab_remove_slot (tab, victim);
++
++    if (refocus_survivor)
++    {
++        gtk_widget_grab_focus (GTK_WIDGET (survivor));
++    }
++
++    update_split_action_state (window);
++
++    g_object_unref (survivor);
++    g_object_unref (victim);
+ }
+ 
+-static NautilusWindowSlot *
+-nautilus_window_create_and_init_slot (NautilusWindow *window)
++static NautilusWindowTab *
++nautilus_window_create_and_init_tab (NautilusWindow     *window,
++                                     NautilusWindowSlot *primary_slot)
+ {
+-    g_autoptr (NautilusWindowSlot) slot = nautilus_window_slot_new (NAUTILUS_MODE_BROWSE);
++    AdwTabPage *current = get_current_page (window);
++    AdwTabPage *page;
++    NautilusWindowTab *tab;
+ 
+-    g_signal_connect_swapped (slot, "notify::allow-stop",
+-                              G_CALLBACK (update_cursor), window);
+-    g_signal_connect (slot, "notify::location",
+-                      G_CALLBACK (on_slot_location_changed), window);
++    g_return_val_if_fail (NAUTILUS_IS_WINDOW_SLOT (primary_slot), NULL);
+ 
+-    AdwTabPage *current = get_current_page (window);
+-    AdwTabPage *page = adw_tab_view_add_page (window->tab_view, GTK_WIDGET (slot), current);
++    tab = nautilus_window_tab_new (primary_slot);
++
++    page = adw_tab_view_add_page (window->tab_view, GTK_WIDGET (tab), current);
+ 
+-    g_object_bind_property (slot, "allow-stop",
++    g_object_bind_property (tab, "loading",
+                             page, "loading",
+                             G_BINDING_SYNC_CREATE);
+-    g_object_bind_property (slot, "title",
++    g_object_bind_property (tab, "title",
+                             page, "title",
+                             G_BINDING_SYNC_CREATE);
+-    g_signal_connect (slot, "notify::title", G_CALLBACK (on_update_page_tooltip), page);
++    g_object_bind_property (tab, "tooltip",
++                            page, "tooltip",
++                            G_BINDING_SYNC_CREATE);
++
++    return tab;
++}
++
++static NautilusWindowSlot *
++nautilus_window_create_and_init_slot (NautilusWindow *window)
++{
++    g_autoptr (NautilusWindowSlot) slot = nautilus_window_slot_new (NAUTILUS_MODE_BROWSE);
+ 
+-    /* Assure that AdwTabView has added slot to slot list */
+-    g_warn_if_fail (g_list_find (window->slots, slot) != NULL);
++    nautilus_window_create_and_init_tab (window, slot);
+ 
+     return slot;
+ }
+@@ -470,6 +766,10 @@ get_slot_with_open_location (NautilusWindow *self,
+     {
+         NautilusWindowSlot *slot = l->data;
+         GFile *slot_location = nautilus_window_slot_get_location (slot);
++        if (!gtk_widget_get_visible (gtk_widget_get_parent (GTK_WIDGET (slot))))
++        {
++            continue;
++        }
+ 
+         if (slot_location != NULL &&
+             g_file_equal (location, slot_location))
+@@ -505,6 +805,7 @@ nautilus_window_open_location_full (NautilusWindow    *window,
+     {
+         gtk_window_present (GTK_WINDOW (window));
+         set_active_slot (window, target_slot);
++        gtk_widget_grab_focus (GTK_WIDGET (target_slot));
+     }
+ 
+     nautilus_window_slot_open_location_full (target_slot, location, selection);
+@@ -545,9 +846,23 @@ nautilus_window_new_tab (NautilusWindow *window)
+     GFile *location;
+ 
+     page = get_current_page (window);
+-    current_slot = NAUTILUS_WINDOW_SLOT (adw_tab_page_get_child (page));
+-    location = nautilus_window_slot_get_location (current_slot);
++    if (page == NULL)
++    {
++        return;
++    }
++
++    NautilusWindowTab *tab = NAUTILUS_WINDOW_TAB (adw_tab_page_get_child (page));
++    current_slot = nautilus_window_tab_get_remembered_slot (tab);
++    if (current_slot == NULL)
++    {
++        current_slot = nautilus_window_tab_get_slot (tab, 0);
++    }
++    if (current_slot == NULL)
++    {
++        return;
++    }
+ 
++    location = nautilus_window_slot_get_location (current_slot);
+     if (location != NULL)
+     {
+         if (g_file_has_uri_scheme (location, SCHEME_SEARCH))
+@@ -643,14 +958,77 @@ places_sidebar_drag_perform_drop_cb (NautilusSidebar *sidebar,
+     g_list_free_full (source_uri_list, g_free);
+ }
+ 
++static void
++closed_tab_state_free (ClosedTabState *state)
++{
++    if (state == NULL)
++    {
++        return;
++    }
++
++    g_clear_pointer (&state->primary_state, free_navigation_state);
++    g_clear_pointer (&state->secondary_state, free_navigation_state);
++    g_free (state);
++}
++
++static void
++capture_closed_tab_state (NautilusWindow    *window,
++                          NautilusWindowTab *tab)
++{
++    NautilusWindowSlot *slot0;
++    NautilusWindowSlot *slot1;
++    ClosedTabState *state;
++
++    slot0 = nautilus_window_tab_get_slot (tab, 0);
++    slot1 = nautilus_window_tab_get_slot (tab, 1);
++
++    if (slot0 == NULL)
++    {
++        return;
++    }
++
++    state = g_new0 (ClosedTabState, 1);
++    state->primary_state = nautilus_window_slot_get_navigation_state (slot0);
++
++    if (slot1 != NULL)
++    {
++        state->secondary_state = nautilus_window_slot_get_navigation_state (slot1);
++        state->split_visible = nautilus_window_tab_is_split (tab);
++        state->position = nautilus_window_tab_get_position (tab);
++    }
++
++    NautilusWindowSlot *remembered = nautilus_window_tab_get_remembered_slot (tab);
++    state->remembered_pane = (remembered == slot1 && slot1 != NULL) ? 1 : 0;
++
++    if (state->primary_state == NULL)
++    {
++        if (state->secondary_state == NULL)
++        {
++            closed_tab_state_free (state);
++            return;
++        }
++        state->primary_state = g_steal_pointer (&state->secondary_state);
++        state->remembered_pane = 0;
++    }
++
++    g_queue_push_head (window->tab_data_queue, state);
++
++    GAction *restore_action = g_action_map_lookup_action (G_ACTION_MAP (window), "restore-tab");
++    if (restore_action != NULL)
++    {
++        g_simple_action_set_enabled (G_SIMPLE_ACTION (restore_action), TRUE);
++    }
++}
++
+ static void
+ action_restore_tab (GSimpleAction *action,
+                     GVariant      *state,
+                     gpointer       user_data)
+ {
+     NautilusWindow *window = NAUTILUS_WINDOW (user_data);
+-    NautilusWindowSlot *slot;
+-    NautilusNavigationState *data;
++    ClosedTabState *data;
++    NautilusWindowTab *tab;
++    g_autoptr (NautilusWindowSlot) primary_slot = NULL;
+ 
+     if (g_queue_get_length (window->tab_data_queue) == 0)
+     {
+@@ -659,11 +1037,45 @@ action_restore_tab (GSimpleAction *action,
+ 
+     data = g_queue_pop_head (window->tab_data_queue);
+ 
+-    slot = nautilus_window_create_and_init_slot (window);
++    primary_slot = nautilus_window_slot_new (NAUTILUS_MODE_BROWSE);
++    tab = nautilus_window_create_and_init_tab (window, primary_slot);
++
++    if (data->primary_state != NULL)
++    {
++        nautilus_window_slot_restore_navigation_state (primary_slot, data->primary_state);
++    }
++
++    if (data->secondary_state != NULL)
++    {
++        g_autoptr (NautilusWindowSlot) secondary_slot = nautilus_window_slot_new (NAUTILUS_MODE_BROWSE);
++        connect_slot (window, secondary_slot);
++        window->slots = g_list_append (window->slots, secondary_slot);
++        nautilus_window_tab_add_secondary (tab, secondary_slot);
++
++        nautilus_window_slot_restore_navigation_state (secondary_slot, data->secondary_state);
++
++        if (data->position > 0)
++        {
++            nautilus_window_tab_set_position (tab, data->position);
++        }
++        if (!data->split_visible)
++        {
++            nautilus_window_tab_remember_slot (tab, data->remembered_pane == 1 ? secondary_slot : primary_slot);
++            nautilus_window_tab_set_split_visible (tab, FALSE);
++        }
++    }
+ 
+-    nautilus_window_slot_restore_navigation_state (slot, data);
++    NautilusWindowSlot *to_activate = nautilus_window_tab_get_slot (tab, data->remembered_pane);
++    if (to_activate == NULL)
++    {
++        to_activate = primary_slot;
++    }
++
++    set_active_slot (window, to_activate);
++    update_split_action_state (window);
++    gtk_widget_grab_focus (GTK_WIDGET (to_activate));
+ 
+-    free_navigation_state (data);
++    closed_tab_state_free (data);
+ 
+     g_simple_action_set_enabled (action, g_queue_get_length (window->tab_data_queue) > 0);
+ }
+@@ -698,48 +1110,6 @@ nautilus_window_set_up_sidebar (NautilusWindow *window)
+                       G_CALLBACK (places_sidebar_drag_perform_drop_cb), window);
+ }
+ 
+-static void
+-window_slot_close (NautilusWindow     *window,
+-                   NautilusWindowSlot *slot)
+-{
+-    NautilusNavigationState *data;
+-    AdwTabPage *page;
+-
+-    g_debug ("Requesting to remove slot %p from window %p", slot, window);
+-    if (window == NULL || slot == NULL)
+-    {
+-        return;
+-    }
+-
+-    data = nautilus_window_slot_get_navigation_state (slot);
+-    if (data != NULL)
+-    {
+-        g_queue_push_head (window->tab_data_queue, data);
+-    }
+-
+-    remove_slot_from_window (slot, window);
+-
+-    page = adw_tab_view_get_page (window->tab_view, GTK_WIDGET (slot));
+-    /* this will destroy the slot */
+-    adw_tab_view_close_page (window->tab_view, page);
+-
+-    /* If that was the last slot in the window, close the window. */
+-    if (window->slots == NULL)
+-    {
+-        g_debug ("Last slot removed, closing the window");
+-        nautilus_window_close (window);
+-    }
+-    else
+-    {
+-        GAction *restore_action = g_action_map_lookup_action (G_ACTION_MAP (window), "restore-tab");
+-
+-        g_simple_action_set_enabled (G_SIMPLE_ACTION (restore_action), TRUE);
+-    }
+-
+-#ifdef HAVE_MALLOC_TRIM
+-    schedule_trim ();
+-#endif
+-}
+ 
+ static void
+ nautilus_window_sync_location_widgets (NautilusWindow *window)
+@@ -982,13 +1352,13 @@ tab_view_close_page_cb (AdwTabView     *view,
+                         AdwTabPage     *page,
+                         NautilusWindow *window)
+ {
+-    NautilusWindowSlot *slot;
++    NautilusWindowTab *tab = NAUTILUS_WINDOW_TAB (adw_tab_page_get_child (page));
+ 
+-    slot = NAUTILUS_WINDOW_SLOT (adw_tab_page_get_child (page));
++    capture_closed_tab_state (window, tab);
+ 
+-    window_slot_close (window, slot);
++    adw_tab_view_close_page_finish (view, page, TRUE);
+ 
+-    return GDK_EVENT_PROPAGATE;
++    return GDK_EVENT_STOP;
+ }
+ 
+ static void
+@@ -997,14 +1367,42 @@ tab_view_page_detached_cb (AdwTabView     *tab_view,
+                            gint            position,
+                            NautilusWindow *window)
+ {
+-    NautilusWindowSlot *slot = NAUTILUS_WINDOW_SLOT (adw_tab_page_get_child (page));
++    NautilusWindowTab *tab = NAUTILUS_WINDOW_TAB (adw_tab_page_get_child (page));
++    NautilusWindowSlot *slot0;
++    NautilusWindowSlot *slot1;
++
++    g_signal_handlers_disconnect_by_data (tab, window);
++
++    slot0 = nautilus_window_tab_get_slot (tab, 0);
++    slot1 = nautilus_window_tab_get_slot (tab, 1);
++
++    if (slot0 != NULL)
++    {
++        if (window->active_slot == slot0)
++        {
++            set_active_slot (window, NULL);
++        }
++        if (g_list_find (window->slots, slot0) != NULL)
++        {
++            remove_slot_from_window (slot0, window);
++        }
++    }
+ 
+-    /* If the tab has been moved to another window, we need to remove the slot
+-     * from the current window here. Otherwise, if the tab has been closed, then
+-     * we have*/
+-    if (g_list_find (window->slots, slot))
++    if (slot1 != NULL)
+     {
+-        remove_slot_from_window (slot, window);
++        if (window->active_slot == slot1)
++        {
++            set_active_slot (window, NULL);
++        }
++        if (g_list_find (window->slots, slot1) != NULL)
++        {
++            remove_slot_from_window (slot1, window);
++        }
++    }
++
++    if (adw_tab_view_get_n_pages (tab_view) == 0)
++    {
++        nautilus_window_close (window);
+     }
+ }
+ 
+@@ -1014,11 +1412,48 @@ tab_view_page_attached_cb (AdwTabView     *tab_view,
+                            gint            position,
+                            NautilusWindow *window)
+ {
+-    NautilusWindowSlot *slot = NAUTILUS_WINDOW_SLOT (adw_tab_page_get_child (page));
++    NautilusWindowTab *tab = NAUTILUS_WINDOW_TAB (adw_tab_page_get_child (page));
++    NautilusWindowSlot *slot0;
++    NautilusWindowSlot *slot1;
+ 
+-    window->slots = g_list_prepend (window->slots, slot);
++    g_signal_connect_object (tab, "activate-slot",
++                             G_CALLBACK (on_tab_activate_slot), window, 0);
++    g_signal_connect_object (tab, "unrooting",
++                             G_CALLBACK (on_tab_unrooting), window, 0);
++    g_signal_connect_object (tab, "notify::loading",
++                             G_CALLBACK (on_tab_loading_changed), window, 0);
++
++    slot0 = nautilus_window_tab_get_slot (tab, 0);
++    slot1 = nautilus_window_tab_get_slot (tab, 1);
++
++    if (slot0 != NULL && g_list_find (window->slots, slot0) == NULL)
++    {
++        connect_slot (window, slot0);
++        window->slots = g_list_append (window->slots, slot0);
++    }
++
++    if (slot1 != NULL && g_list_find (window->slots, slot1) == NULL)
++    {
++        connect_slot (window, slot1);
++        window->slots = g_list_append (window->slots, slot1);
++    }
+ 
+     g_signal_emit (window, signals[LOCATIONS_CHANGED], 0);
++
++    if (page == adw_tab_view_get_selected_page (tab_view))
++    {
++        NautilusWindowSlot *slot = nautilus_window_tab_get_remembered_slot (tab);
++        if (slot == NULL)
++        {
++            slot = slot0;
++        }
++        if (slot != NULL)
++        {
++            set_active_slot (window, slot);
++        }
++    }
++
++    update_split_action_state (window);
+ }
+ 
+ static AdwTabView *
+@@ -1056,8 +1491,24 @@ extra_drag_value_cb (AdwTabBar    *self,
+                      const GValue *value,
+                      gpointer      user_data)
+ {
+-    NautilusWindowSlot *slot = NAUTILUS_WINDOW_SLOT (adw_tab_page_get_child (page));
+-    g_autoptr (NautilusFile) file = nautilus_file_get (nautilus_window_slot_get_location (slot));
++    NautilusWindowTab *tab = NAUTILUS_WINDOW_TAB (adw_tab_page_get_child (page));
++    NautilusWindowSlot *slot = nautilus_window_tab_get_remembered_slot (tab);
++    if (slot == NULL)
++    {
++        slot = nautilus_window_tab_get_slot (tab, 0);
++    }
++    if (slot == NULL)
++    {
++        return 0;
++    }
++
++    GFile *location = nautilus_window_slot_get_location (slot);
++    if (location == NULL)
++    {
++        return 0;
++    }
++
++    g_autoptr (NautilusFile) file = nautilus_file_get (location);
+     GdkDragAction action = 0;
+ 
+     if (value != NULL)
+@@ -1085,9 +1536,24 @@ extra_drag_drop_cb (AdwTabBar    *self,
+                     const GValue *value,
+                     gpointer      user_data)
+ {
+-    NautilusWindowSlot *slot = NAUTILUS_WINDOW_SLOT (adw_tab_page_get_child (page));
++    NautilusWindowTab *tab = NAUTILUS_WINDOW_TAB (adw_tab_page_get_child (page));
++    NautilusWindowSlot *slot = nautilus_window_tab_get_remembered_slot (tab);
++    if (slot == NULL)
++    {
++        slot = nautilus_window_tab_get_slot (tab, 0);
++    }
++    if (slot == NULL)
++    {
++        return FALSE;
++    }
++
+     NautilusFilesView *view = nautilus_window_slot_get_current_view (slot);
+     GFile *target_location = nautilus_window_slot_get_location (slot);
++    if (view == NULL || target_location == NULL)
++    {
++        return FALSE;
++    }
++
+     GdkDragAction action = adw_tab_bar_get_extra_drag_preferred_action (self);
+ 
+     return nautilus_dnd_perform_drop (view, value, action, target_location);
+@@ -1102,6 +1568,7 @@ const GActionEntry win_entries[] =
+     { .name = "open-tab-overview", .activate = action_open_tab_overview },
+     /* Only accessible by shortcuts */
+     { .name = "close-current-view", .activate = action_close_current_view },
++    { .name = "close-tab", .activate = action_close_tab },
+     { .name = "close-other-tabs", .activate = action_close_other_tabs },
+     { .name = "go-home", .activate = action_go_home },
+     { .name = "tab-move-left", .activate = action_tab_move_left },
+@@ -1110,8 +1577,9 @@ const GActionEntry win_entries[] =
+     { .name = "go-to-tab", .parameter_type = "i", .state = "0", .change_state = action_go_to_tab },
+     { .name = "restore-tab", .activate = action_restore_tab },
+     { .name = "toggle-sidebar", .activate = action_toggle_sidebar },
++    { .name = "toggle-split", .activate = action_toggle_split, .state = "false" },
++    { .name = "switch-pane", .activate = action_switch_pane },
+ };
+-
+ static void
+ nautilus_window_initialize_actions (NautilusWindow *window)
+ {
+@@ -1125,6 +1593,20 @@ nautilus_window_initialize_actions (NautilusWindow *window)
+                                      win_entries, G_N_ELEMENTS (win_entries),
+                                      window);
+ 
++    GtkShortcutController *controller = GTK_SHORTCUT_CONTROLLER (gtk_shortcut_controller_new ());
++    gtk_shortcut_controller_set_scope (controller, GTK_SHORTCUT_SCOPE_MANAGED);
++    gtk_widget_add_controller (GTK_WIDGET (window->tab_view), GTK_EVENT_CONTROLLER (controller));
++
++#define ADD_SHORTCUT_FOR_ACTION(ctrl, act, trigger) \
++    (gtk_shortcut_controller_add_shortcut ((ctrl), \
++                                           gtk_shortcut_new (gtk_shortcut_trigger_parse_string ((trigger)), \
++                                                             gtk_named_action_new ((act)))))
++
++    ADD_SHORTCUT_FOR_ACTION (controller, "win.toggle-split", "F3");
++    ADD_SHORTCUT_FOR_ACTION (controller, "win.switch-pane", "F6");
++    ADD_SHORTCUT_FOR_ACTION (controller, "win.switch-pane", "<Shift>F6");
++#undef ADD_SHORTCUT_FOR_ACTION
++
+ #define ACCELS(...) ((const char *[]) { __VA_ARGS__, NULL })
+ 
+     app = g_application_get_default ();
+@@ -1159,6 +1641,7 @@ nautilus_window_initialize_actions (NautilusWindow *window)
+ 
+     action = g_action_map_lookup_action (G_ACTION_MAP (window), "restore-tab");
+     g_simple_action_set_enabled (G_SIMPLE_ACTION (action), FALSE);
++    update_split_action_state (window);
+ }
+ 
+ static gboolean
+@@ -1289,7 +1772,7 @@ nautilus_window_finalize (GObject *object)
+                                           G_CALLBACK (nautilus_window_on_undo_changed),
+                                           window);
+ 
+-    g_queue_free_full (window->tab_data_queue, free_navigation_state);
++    g_queue_free_full (window->tab_data_queue, (GDestroyNotify) closed_tab_state_free);
+ 
+     /* nautilus_window_close() should have run */
+     g_warn_if_fail (window->slots == NULL);
+@@ -1347,13 +1830,26 @@ set_active_slot (NautilusWindow     *window,
+     g_return_if_fail (new_slot == NULL ||
+                       gtk_widget_is_ancestor (GTK_WIDGET (new_slot), GTK_WIDGET (window)));
+ 
+-    if (old_slot == new_slot)
++    if (old_slot == new_slot || window->in_set_active_slot)
+     {
+         return;
+     }
+ 
++    window->in_set_active_slot = TRUE;
++
+     g_debug ("Setting new slot %p as active, old slot inactive %p", new_slot, old_slot);
+ 
++    NautilusWindowTab *tab = NULL;
++    if (new_slot != NULL)
++    {
++        tab = NAUTILUS_WINDOW_TAB (gtk_widget_get_ancestor (GTK_WIDGET (new_slot),
++                                                            NAUTILUS_TYPE_WINDOW_TAB));
++        if (tab != NULL)
++        {
++            nautilus_window_tab_remember_slot (tab, new_slot);
++        }
++    }
++
+     /* make old slot inactive if it exists (may be NULL after init, for example) */
+     if (old_slot != NULL)
+     {
+@@ -1364,11 +1860,16 @@ set_active_slot (NautilusWindow     *window,
+     g_set_weak_pointer (&window->active_slot, new_slot);
+ 
+     /* make new slot active, if it exists */
+-    if (new_slot)
++    if (new_slot != NULL)
+     {
+-        AdwTabPage *page = adw_tab_view_get_page (window->tab_view,
+-                                                  GTK_WIDGET (new_slot));
+-        adw_tab_view_set_selected_page (window->tab_view, page);
++        if (tab != NULL)
++        {
++            AdwTabPage *page = adw_tab_view_get_page (window->tab_view, GTK_WIDGET (tab));
++            if (page != NULL && adw_tab_view_get_selected_page (window->tab_view) != page)
++            {
++                adw_tab_view_set_selected_page (window->tab_view, page);
++            }
++        }
+ 
+         /* inform slot & view */
+         nautilus_window_slot_set_active (new_slot, TRUE);
+@@ -1378,6 +1879,8 @@ set_active_slot (NautilusWindow     *window,
+     }
+ 
+     g_object_notify_by_pspec (G_OBJECT (window), properties[PROP_ACTIVE_SLOT]);
++    update_split_action_state (window);
++    window->in_set_active_slot = FALSE;
+ }
+ 
+ static void
+@@ -1451,6 +1954,10 @@ nautilus_window_get_locations (NautilusWindow *self)
+     {
+         NautilusWindowSlot *slot = l->data;
+         GFile *location = nautilus_window_slot_get_location (slot);
++        if (!gtk_widget_get_visible (gtk_widget_get_parent (GTK_WIDGET (slot))))
++        {
++            continue;
++        }
+ 
+         if (location != NULL)
+         {
+@@ -1563,6 +2070,7 @@ nautilus_window_init (NautilusWindow *window)
+     g_type_ensure (NAUTILUS_TYPE_PROGRESS_INDICATOR);
+     g_type_ensure (NAUTILUS_TYPE_SHORTCUT_MANAGER);
+     gtk_widget_init_template (GTK_WIDGET (window));
++    gtk_widget_get_size_request (GTK_WIDGET (window), &window->single_pane_min_width, NULL);
+ 
+     g_signal_connect (window, "notify::maximized",
+                       G_CALLBACK (on_is_maximized_changed), NULL);
+diff --git a/src/resources/nautilus.gresource.xml.in b/src/resources/nautilus.gresource.xml.in
+index 1e52a1e..675f754 100644
+--- a/src/resources/nautilus.gresource.xml.in
++++ b/src/resources/nautilus.gresource.xml.in
+@@ -41,6 +41,7 @@
+     <file preprocess="xml-stripblanks">ui/nautilus-toolbar.ui</file>
+     <file preprocess="xml-stripblanks">ui/nautilus-view-controls.ui</file>
+     <file preprocess="xml-stripblanks">ui/nautilus-window.ui</file>
++    <file preprocess="xml-stripblanks">ui/nautilus-window-tab.ui</file>
+     <file preprocess="xml-stripblanks" alias="shortcuts-dialog.ui">ui/shortcuts-dialog.ui</file>
+     <!-- Images -->
+     <file>image/checkerboard.png</file>
+diff --git a/src/resources/style.css b/src/resources/style.css
+index 757ae05..c490a7f 100644
+--- a/src/resources/style.css
++++ b/src/resources/style.css
+@@ -424,3 +424,40 @@ rubberband {
+ .toolbar.no-bottom-padding {
+   padding-bottom: 0px;
+ }
++
++.nautilus-window-tab.split-view > paned {
++  margin: 6px;
++}
++
++.nautilus-window-tab.split-view .split-pane.card {
++  border-radius: 12px;
++  margin: 0;
++  transition: background-color 200ms ease;
++}
++
++.nautilus-window-tab.split-view .split-pane.card.active-pane,
++.nautilus-window-tab.split-view .split-pane.card.active-pane .view {
++  background-color: var(--card-bg-color);
++}
++
++.nautilus-window-tab.split-view .split-pane.card.inactive-pane,
++.nautilus-window-tab.split-view .split-pane.card.inactive-pane .view {
++  background-color: color-mix(in srgb, var(--window-bg-color) 70%, var(--card-bg-color));
++}
++
++.nautilus-window-tab.split-view > paned:dir(ltr) > .split-pane:first-child,
++.nautilus-window-tab.split-view > paned:dir(rtl) > .split-pane:last-child {
++  margin-right: 2px;
++}
++
++.nautilus-window-tab.split-view > paned:dir(ltr) > .split-pane:last-child,
++.nautilus-window-tab.split-view > paned:dir(rtl) > .split-pane:first-child {
++  margin-left: 2px;
++}
++
++.nautilus-window-tab.split-view > paned > separator {
++  min-width: 4px;
++  background: none;
++  border: none;
++  box-shadow: none;
++}
+diff --git a/src/resources/ui/meson.build b/src/resources/ui/meson.build
+index 310a3d9..2ec7712 100644
+--- a/src/resources/ui/meson.build
++++ b/src/resources/ui/meson.build
+@@ -32,6 +32,7 @@ blueprint_names = [
+   'nautilus-toolbar',
+   'nautilus-view-controls',
+   'nautilus-window',
++  'nautilus-window-tab',
+   'shortcuts-dialog',
+ ]
+ 
+diff --git a/src/resources/ui/nautilus-window-tab.blp b/src/resources/ui/nautilus-window-tab.blp
+new file mode 100644
+index 0000000..bfb44f3
+--- /dev/null
++++ b/src/resources/ui/nautilus-window-tab.blp
+@@ -0,0 +1,26 @@
++using Gtk 4.0;
++using Adw 1;
++
++template $NautilusWindowTab: Adw.Bin {
++  child: Paned paned {
++    orientation: horizontal;
++    wide-handle: false;
++    // GtkPaned defaults to hidden, which clips the islands' outside shadows.
++    overflow: visible;
++    resize-start-child: true;
++    resize-end-child: true;
++    shrink-start-child: true;
++    shrink-end-child: true;
++
++    [start]
++    Box start_box {
++      orientation: vertical;
++      hexpand: true;
++      vexpand: true;
++      width-request: 0;
++      height-request: 0;
++      overflow: hidden;
++      styles [ "split-pane" ]
++    }
++  };
++}
+diff --git a/src/resources/ui/nautilus-window.blp b/src/resources/ui/nautilus-window.blp
+index a955814..0bffa08 100644
+--- a/src/resources/ui/nautilus-window.blp
++++ b/src/resources/ui/nautilus-window.blp
+@@ -19,6 +19,11 @@ menu app_menu {
+       label: _("Show All Ta_bs");
+       action: "win.open-tab-overview";
+     }
++
++    item {
++      label: _("Dual _Pane");
++      action: "win.toggle-split";
++    }
+   }
+ 
+   section undo_redo_section {
+@@ -95,9 +100,8 @@ menu tab_menu_model {
+   section {
+     item {
+       label: _("_Close Tab");
+-      action: "win.close-current-view";
++      action: "win.close-tab";
+     }
+-
+     item {
+       label: _("Close _Other Tabs");
+       action: "win.close-other-tabs";
+diff --git a/src/resources/ui/shortcuts-dialog.blp b/src/resources/ui/shortcuts-dialog.blp
+index 5a93df6..84a5530 100644
+--- a/src/resources/ui/shortcuts-dialog.blp
++++ b/src/resources/ui/shortcuts-dialog.blp
+@@ -308,10 +308,19 @@ Adw.ShortcutsDialog shortcuts_dialog {
+     }
+ 
+     Adw.ShortcutsItem {
+-      title: C_("shortcuts dialog", "Close Window or Tab");
+-      action-name: "win.close-current-view";
++      title: C_("shortcuts dialog", "Dual Pane");
++      accelerator: "F3";
++    }
++
++    Adw.ShortcutsItem {
++      title: C_("shortcuts dialog", "Switch Pane");
++      accelerator: "F6 <Shift>F6 Tab <Shift>Tab";
+     }
+ 
++    Adw.ShortcutsItem {
++      title: C_("shortcuts dialog", "Close Pane or Current View");
++      action-name: "win.close-current-view";
++    }
+     Adw.ShortcutsItem {
+       title: C_("shortcuts dialog", "Show All Tabs");
+       action-name: "win.open-tab-overview";

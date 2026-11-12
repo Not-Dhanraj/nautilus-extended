@@ -1,32 +1,41 @@
-From e401d3347eb0e9a123fde4a8ec455b25fb1cd935 Mon Sep 17 00:00:00 2001
+From dfea043f3b58c85a8713855771be1bd1cf228de4 Mon Sep 17 00:00:00 2001
 From: Dhanraj <dp914278@gmail.com>
 Date: Thu, 22 Oct 2026 02:38:22 +0530
-Subject: [PATCH 4/5] Add virtualized grouped icon view
+Subject: [PATCH 04/10] grid-view: Add virtualized grouped icons and normalized
+ keyboard navigation
 
+Render sectioned icons through a row model and grouped controller backed
+by the existing selection model, preserving drag/drop, scrolling and
+section geometry without realizing every file widget.
+
+Normalize keypad horizontal keys before RTL swapping, and document the
+owned nullable first-row getter. Include grouped geometry/selection and
+eight-case selected-file keyboard regressions in this feature commit.
 ---
  NEWS                             |    6 +-
  po/POTFILES.in                   |    1 +
  src/meson.build                  |    4 +
  src/nautilus-files-view.c        |    2 +-
  src/nautilus-grid-row-model.c    |  438 +++++++++++
- src/nautilus-grid-row-model.h    |   42 +
+ src/nautilus-grid-row-model.h    |   49 ++
  src/nautilus-grid-view.c         |  287 +++++--
- src/nautilus-grouped-grid.c      | 1221 ++++++++++++++++++++++++++++++
+ src/nautilus-grouped-grid.c      | 1224 ++++++++++++++++++++++++++++++
  src/nautilus-grouped-grid.h      |   40 +
  src/nautilus-list-base-private.h |    2 -
  src/nautilus-list-base.c         |    6 -
- test/display/test-files-view.c   |    4 +
- 12 files changed, 1998 insertions(+), 55 deletions(-)
+ test/display/test-files-view.c   |   93 +++
+ 12 files changed, 2097 insertions(+), 55 deletions(-)
  create mode 100644 src/nautilus-grid-row-model.c
  create mode 100644 src/nautilus-grid-row-model.h
  create mode 100644 src/nautilus-grouped-grid.c
  create mode 100644 src/nautilus-grouped-grid.h
 
 diff --git a/NEWS b/NEWS
-index f91f45755..901b6f9dc 100644
+index f52e5c332..1b5858cd1 100644
 --- a/NEWS
 +++ b/NEWS
-@@ -1,8 +1,8 @@
+@@ -4,9 +4,9 @@ Downstream changes (nautilus-typeahead)
+   return to the previous location in history, without restarting Files.
  Downstream grouping support
  ===========================
 -- Add per-folder time/name grouping to list views and list-mode Nautilus choosers.
@@ -528,10 +537,10 @@ index 000000000..066247a9f
 +}
 diff --git a/src/nautilus-grid-row-model.h b/src/nautilus-grid-row-model.h
 new file mode 100644
-index 000000000..50653a57a
+index 000000000..75eaf4b5b
 --- /dev/null
 +++ b/src/nautilus-grid-row-model.h
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,49 @@
 +/*
 + * Copyright (C) 2022 The GNOME project contributors
 + *
@@ -556,6 +565,13 @@ index 000000000..50653a57a
 +guint              nautilus_grid_row_get_start_index    (NautilusGridRow *self);
 +guint              nautilus_grid_row_get_n_items        (NautilusGridRow *self);
 +gboolean           nautilus_grid_row_get_starts_section (NautilusGridRow *self);
++/**
++ * nautilus_grid_row_get_first_row:
++ * @self: a grid row
++ *
++ * Returns: (transfer full) (nullable): the first file's tree row,
++ *   or NULL if unavailable
++ */
 +GtkTreeListRow    *nautilus_grid_row_get_first_row      (NautilusGridRow *self);
 +
 +/* NautilusGridRowModel methods */
@@ -1057,10 +1073,10 @@ index b10bce15f..5eb468ab5 100644
                                     GTK_WIDGET (self->view_ui));
 diff --git a/src/nautilus-grouped-grid.c b/src/nautilus-grouped-grid.c
 new file mode 100644
-index 000000000..bc2d2eb78
+index 000000000..56b6e4444
 --- /dev/null
 +++ b/src/nautilus-grouped-grid.c
-@@ -0,0 +1,1221 @@
+@@ -0,0 +1,1224 @@
 +/*
 + * Copyright (C) 2022 The GNOME project contributors
 + *
@@ -1206,6 +1222,11 @@ index 000000000..bc2d2eb78
 +    gboolean ctrl = (state & GDK_CONTROL_MASK) != 0;
 +    gboolean rtl = gtk_widget_get_direction (GTK_WIDGET (self->view)) == GTK_TEXT_DIR_RTL;
 +
++    if (keyval == GDK_KEY_KP_Left || keyval == GDK_KEY_KP_Right)
++    {
++        keyval = keyval == GDK_KEY_KP_Left ? GDK_KEY_Left : GDK_KEY_Right;
++    }
++
 +    if (rtl && (keyval == GDK_KEY_Left || keyval == GDK_KEY_Right))
 +    {
 +        keyval = keyval == GDK_KEY_Left ? GDK_KEY_Right : GDK_KEY_Left;
@@ -1239,7 +1260,6 @@ index 000000000..bc2d2eb78
 +    switch (keyval)
 +    {
 +        case GDK_KEY_Left:
-+        case GDK_KEY_KP_Left:
 +        {
 +            if (current_pos > 0)
 +            {
@@ -1253,7 +1273,6 @@ index 000000000..bc2d2eb78
 +        break;
 +
 +        case GDK_KEY_Right:
-+        case GDK_KEY_KP_Right:
 +        {
 +            if (current_pos + 1 < total_items)
 +            {
@@ -2342,7 +2361,7 @@ index 33cb4a971..246a3104c 100644
  void                          nautilus_list_base_bind_group_header_widget (GtkWidget        *header,
                                                                             NautilusListBase *self,
 diff --git a/src/nautilus-list-base.c b/src/nautilus-list-base.c
-index 793c8057e..d5fb92cd9 100644
+index a08b3438f..c8da63643 100644
 --- a/src/nautilus-list-base.c
 +++ b/src/nautilus-list-base.c
 @@ -924,12 +924,6 @@ setup_cell_hover (NautilusViewCell *cell)
@@ -2359,12 +2378,116 @@ index 793c8057e..d5fb92cd9 100644
  void
  setup_cell_common (GObject          *listitem,
 diff --git a/test/display/test-files-view.c b/test/display/test-files-view.c
-index ff1092193..93f9b9c50 100644
+index ceccc465c..32f46150f 100644
 --- a/test/display/test-files-view.c
 +++ b/test/display/test-files-view.c
-@@ -1840,9 +1840,13 @@ main (int   argc,
+@@ -25,6 +25,7 @@
+ #include <nautilus-view-item.h>
+ #include <nautilus-view-model.h>
+ #include <nautilus-window-slot.h>
++#include <gdk/gdkkeysyms.h>
+ 
+ #define G_LOG_DOMAIN "test-files-view"
+ 
+@@ -1849,6 +1850,93 @@ test_backspace_navigation (void)
+     test_clear_tmp_dir ();
+ }
+ 
++static void
++assert_selection_single_name (NautilusFilesView *view,
++                              const char        *expected_name)
++{
++    g_autolist (NautilusFile) selection = nautilus_files_view_get_selection (view);
++
++    g_assert_cmpuint (g_list_length (selection), ==, 1);
++    g_assert_cmpstr (nautilus_file_get_display_name (selection->data), ==, expected_name);
++}
++
++static void
++test_grouped_grid_keypad_arrows (void)
++{
++    g_autoptr (NautilusWindowSlot) slot = NULL;
++    g_autoptr (NautilusFilesView) view = create_view_with_slot (NAUTILUS_MODE_BROWSE,
++                                                            NAUTILUS_VIEW_GRID_ID,
++                                                            &slot);
++    NautilusListBase *base = nautilus_files_view_get_private_list_base (view);
++    GActionGroup *actions = nautilus_files_view_get_private_action_group (view);
++    g_autoptr (GFile) dir = g_file_new_build_filename (test_get_tmp_dir (), "keypad_nav", NULL);
++    g_autoptr (GError) error = NULL;
++    const char *names[] = { "item_0.txt", "item_1.txt", "item_2.txt", "item_3.txt", "item_4.txt" };
++    const struct
++    {
++        GtkTextDirection direction;
++        guint keyval;
++        guint expected;
++    } cases[] = {
++        { GTK_TEXT_DIR_LTR, GDK_KEY_Left, 1 },
++        { GTK_TEXT_DIR_LTR, GDK_KEY_KP_Left, 1 },
++        { GTK_TEXT_DIR_LTR, GDK_KEY_Right, 3 },
++        { GTK_TEXT_DIR_LTR, GDK_KEY_KP_Right, 3 },
++        { GTK_TEXT_DIR_RTL, GDK_KEY_Left, 3 },
++        { GTK_TEXT_DIR_RTL, GDK_KEY_KP_Left, 3 },
++        { GTK_TEXT_DIR_RTL, GDK_KEY_Right, 1 },
++        { GTK_TEXT_DIR_RTL, GDK_KEY_KP_Right, 1 },
++    };
++    g_autoptr (GListModel) controllers = NULL;
++    g_autoptr (GtkEventControllerKey) key_controller = NULL;
++
++    g_assert_true (g_file_make_directory (dir, NULL, &error));
++    g_assert_no_error (error);
++    for (guint i = 0; i < G_N_ELEMENTS (names); i++)
++    {
++        g_autoptr (GFile) child = g_file_get_child (dir, names[i]);
++
++        g_assert_true (g_file_replace_contents (child, "content", 7, NULL, FALSE,
++                                              G_FILE_CREATE_NONE, NULL, NULL, &error));
++        g_assert_no_error (error);
++    }
++
++    nautilus_files_view_set_location (view, dir);
++    ITER_CONTEXT_WHILE (nautilus_files_view_get_loading (view));
++    g_action_group_change_action_state (actions, "sort", g_variant_new ("(sb)", "name", FALSE));
++    g_action_group_change_action_state (actions, "grouping", g_variant_new_string ("name"));
++
++    controllers = gtk_widget_observe_controllers (GTK_WIDGET (base));
++    for (guint i = 0; i < g_list_model_get_n_items (controllers); i++)
++    {
++        g_autoptr (GObject) controller = g_list_model_get_item (controllers, i);
++
++        if (GTK_IS_EVENT_CONTROLLER_KEY (controller))
++        {
++            key_controller = GTK_EVENT_CONTROLLER_KEY (g_steal_pointer (&controller));
++            break;
++        }
++    }
++    g_assert_nonnull (key_controller);
++
++    g_autoptr (GFile) middle_file = g_file_get_child (dir, names[2]);
++    g_autoptr (NautilusFile) middle = nautilus_file_get (middle_file);
++    for (guint i = 0; i < G_N_ELEMENTS (cases); i++)
++    {
++        gboolean handled = FALSE;
++
++        gtk_widget_set_direction (GTK_WIDGET (base), cases[i].direction);
++        nautilus_files_view_set_selection (view, &(GList) { .data = middle },
++                                          NAUTILUS_SELECTION_SOURCE_MANUAL);
++        g_signal_emit_by_name (key_controller, "key-pressed", cases[i].keyval, 0, 0, &handled);
++        g_assert_true (handled);
++        assert_selection_single_name (view, names[cases[i].expected]);
++    }
++
++    test_clear_tmp_dir ();
++}
++
++
+ int
+ main (int   argc,
+       char *argv[])
+@@ -1899,10 +1987,15 @@ main (int   argc,
      g_test_add_func ("/view/actions/zoom",
                       test_zoom_actions);
+     g_test_add_func ("/view/navigation/backspace", test_backspace_navigation);
++    g_test_add_func ("/view/navigation/keypad_arrows", test_grouped_grid_keypad_arrows);
      g_test_add_data_func ("/view/grouping/list", GUINT_TO_POINTER (NAUTILUS_VIEW_LIST_ID), test_time_grouping);
 +    g_test_add_data_func ("/view/grouping/grid", GUINT_TO_POINTER (NAUTILUS_VIEW_GRID_ID), test_time_grouping);
      g_test_add_data_func ("/view/grouping/folders/list", GUINT_TO_POINTER (NAUTILUS_VIEW_LIST_ID), test_time_grouping_folders);

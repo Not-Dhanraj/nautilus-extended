@@ -1,0 +1,171 @@
+From 424b15ff8f21e3ea18da550242e5c9b9f43f3824 Mon Sep 17 00:00:00 2001
+From: Dhanraj <dp914278@gmail.com>
+Date: Fri, 30 Oct 2026 23:34:04 +0530
+Subject: [PATCH 06/10] grouped-grid: Use native GTK selection styling
+
+Render grouped highlights and rubberband rectangles through GTK selection
+nodes and theme state instead of a separate palette. Keep this appearance
+change independent of external-open navigation policy so either behavior
+can be reviewed or reverted without the other.
+---
+ NEWS                        |  2 ++
+ src/nautilus-grouped-grid.c | 23 +++++++++++++++++------
+ src/resources/style.css     | 30 +++++++-----------------------
+ 3 files changed, 26 insertions(+), 29 deletions(-)
+
+diff --git a/NEWS b/NEWS
+index 0c430cdaf..cafa3f7eb 100644
+--- a/NEWS
++++ b/NEWS
+@@ -2,6 +2,8 @@ Downstream changes (nautilus-typeahead)
+ =====================================
+ - Add a Backspace Action preference: go to the parent folder (default) or
+   return to the previous location in history, without restarting Files.
++- Use native GTK selection nodes and theme states for grouped icon highlights
++  and rubberband rectangles, including neutral view accents and contrast rules.
+ - Add per-folder time and name grouping in both icon and list views, including
+   Nautilus's own Open File/Open Folder chooser. View Options offers No Grouping,
+   Group by Time, and Group by Name (A–Z). Downloads defaults to time grouping.
+diff --git a/src/nautilus-grouped-grid.c b/src/nautilus-grouped-grid.c
+index 56b6e4444..9dfc0d591 100644
+--- a/src/nautilus-grouped-grid.c
++++ b/src/nautilus-grouped-grid.c
+@@ -51,6 +51,7 @@ struct _NautilusGroupedGrid
+ 
+ G_DEFINE_FINAL_TYPE (NautilusGroupedGrid, nautilus_grouped_grid, G_TYPE_OBJECT)
+ 
++
+ static guint
+ get_icon_size_for_zoom_level (NautilusGridZoomLevel zoom_level)
+ {
+@@ -338,12 +339,10 @@ update_slot_selection (GtkWidget *slot,
+     if (selected)
+     {
+         gtk_widget_set_state_flags (slot, GTK_STATE_FLAG_SELECTED, FALSE);
+-        gtk_widget_add_css_class (slot, "selected");
+     }
+     else
+     {
+         gtk_widget_unset_state_flags (slot, GTK_STATE_FLAG_SELECTED);
+-        gtk_widget_remove_css_class (slot, "selected");
+     }
+ }
+ 
+@@ -515,8 +514,13 @@ on_cell_click_stopped (GtkGestureClick *gesture,
+ static GtkWidget *
+ create_slot (NautilusGroupedGrid *self)
+ {
+-    GtkWidget *slot = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
++    GtkWidget *slot = g_object_new (GTK_TYPE_BOX,
++                                     "css-name", "child",
++                                     "orientation", GTK_ORIENTATION_VERTICAL,
++                                     "spacing", 0,
++                                     NULL);
+     gtk_widget_add_css_class (slot, "grouped-grid-cell");
++    gtk_widget_add_css_class (slot, "activatable");
+     gtk_widget_set_halign (slot, GTK_ALIGN_CENTER);
+     gtk_widget_set_valign (slot, GTK_ALIGN_START);
+ 
+@@ -552,7 +556,11 @@ setup_row_item (GtkSignalListItemFactory *factory,
+                 gpointer                  user_data)
+ {
+     GtkWidget *container = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
+-    GtkWidget *row_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
++    GtkWidget *row_box = g_object_new (GTK_TYPE_BOX,
++                                        "css-name", "gridview",
++                                        "orientation", GTK_ORIENTATION_HORIZONTAL,
++                                        "spacing", 0,
++                                        NULL);
+ 
+     gtk_box_set_homogeneous (GTK_BOX (row_box), TRUE);
+     gtk_widget_add_css_class (row_box, "grouped-grid-row");
+@@ -1020,8 +1028,11 @@ nautilus_grouped_grid_new (NautilusListBase *view)
+ 
+     self->grouped_view_ui = g_object_ref_sink (create_grouped_view_ui (self));
+ 
+-    GtkWidget *rubberband = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
+-    gtk_widget_add_css_class (rubberband, "rubberband");
++    GtkWidget *rubberband = g_object_new (GTK_TYPE_BOX,
++                                          "css-name", "rubberband",
++                                          "orientation", GTK_ORIENTATION_HORIZONTAL,
++                                          "spacing", 0,
++                                          NULL);
+     gtk_widget_set_can_target (rubberband, FALSE);
+     gtk_widget_set_can_focus (rubberband, FALSE);
+     gtk_widget_set_halign (rubberband, GTK_ALIGN_START);
+diff --git a/src/resources/style.css b/src/resources/style.css
+index 1973cdefc..757ae05bb 100644
+--- a/src/resources/style.css
++++ b/src/resources/style.css
+@@ -162,7 +162,8 @@
+   border-spacing: 6px;
+ }
+ 
+-.nautilus-grid-view gridview > child {
++.nautilus-grid-view gridview > child,
++.nautilus-grid-view .grouped-grid-cell {
+   padding: 0px;
+   border-radius: 12px;
+ }
+@@ -175,21 +176,6 @@
+   padding: 3px 18px;
+ }
+ 
+-.nautilus-grid-view .grouped-grid-cell {
+-  padding: 0;
+-  border-radius: 12px;
+-}
+-
+-.nautilus-grid-view .grouped-grid-cell:hover {
+-  box-shadow: inset 0 0 0 1px var(--border-color);
+-}
+-
+-.nautilus-grid-view .grouped-grid-cell.selected,
+-.nautilus-grid-view .grouped-grid-cell:selected {
+-  background-color: color-mix(in srgb, var(--accent-bg-color) 25%, transparent);
+-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-color) 60%, transparent);
+-}
+-
+ .grouped-section-header {
+   margin-top: 32px;
+   margin-bottom: 12px;
+@@ -210,11 +196,6 @@
+   margin-right: 6px;
+ }
+ 
+-.nautilus-grid-view .rubberband {
+-  border-radius: 6px;
+-  background-color: color-mix(in srgb, var(--accent-bg-color) 20%, transparent);
+-  border: 1px solid color-mix(in srgb, var(--accent-color) 60%, transparent);
+-}
+ 
+ /* Column view */
+ 
+@@ -259,12 +240,14 @@
+ 
+ @media (prefers-contrast: more) {
+   .nautilus-list-view columnview > listview > row.activatable:hover,
+-  .nautilus-grid-view gridview > child.activatable:hover {
++  .nautilus-grid-view gridview > child.activatable:hover,
++  .nautilus-grid-view .grouped-grid-cell.activatable:hover {
+     box-shadow: inset 0 0 0 1px var(--border-color);
+   }
+ 
+   .nautilus-list-view columnview > listview > row:selected,
+-  .nautilus-grid-view gridview > child:selected {
++  .nautilus-grid-view gridview > child:selected,
++  .nautilus-grid-view .grouped-grid-cell:selected {
+     box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-color) 60%, transparent);
+   }
+ }
+@@ -402,6 +385,7 @@ rubberband {
+ .nautilus-list-view listview,
+ .nautilus-grid-view gridview,
+ .nautilus-grid-view listview,
++.nautilus-grid-view rubberband,
+ .nautilus-network-view listview {
+   --accent-bg-color: #959595;
+   --accent-color: oklab(from var(--accent-bg-color) var(--standalone-color-oklab));
+-- 
+2.56.0
+

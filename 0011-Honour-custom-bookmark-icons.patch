@@ -1,0 +1,536 @@
+From: Nautilus Extended
+Subject: [PATCH] Add independent custom icons and native Nautilus icon pickers
+
+Store a sidebar-only symbolic SVG URI with validated change/reset actions.
+Use NautilusFileChooser for both bookmark and Properties icon selection,
+sharing view/zoom/window settings while retaining Properties image validation.
+Keep a regular file alive while selecting it in its parent directory.
+
+--- a/src/nautilus-bookmark.c
++++ b/src/nautilus-bookmark.c
+@@ -33,6 +33,7 @@
+ #include "nautilus-file.h"
+ #include "nautilus-file-utilities.h"
+ #include "nautilus-icon-names.h"
++#include "nautilus-metadata.h"
+ 
+ enum
+ {
+@@ -70,6 +71,7 @@
+ };
+ 
+ static void nautilus_bookmark_disconnect_file (NautilusBookmark *file);
++static void nautilus_bookmark_set_icon_to_default (NautilusBookmark *bookmark);
+ 
+ G_DEFINE_FINAL_TYPE (NautilusBookmark, nautilus_bookmark, G_TYPE_OBJECT);
+ 
+@@ -150,6 +152,7 @@
+     else
+     {
+         bookmark_set_name_from_ready_file (bookmark, file);
++        nautilus_bookmark_set_icon_to_default (bookmark);
+     }
+ }
+ 
+@@ -191,6 +194,24 @@
+         return g_themed_icon_new (symbolic ? "dialog-warning-symbolic" : "dialog-warning");
+     }
+ 
++    if (bookmark->file != NULL)
++    {
++        const char *symbolic_uri = nautilus_file_get_metadata (bookmark->file,
++                                                              NAUTILUS_METADATA_KEY_CUSTOM_SYMBOLIC_ICON,
++                                                              NULL);
++        if (symbolic && symbolic_uri != NULL)
++        {
++            g_autoptr (GFile) icon_file = g_file_new_for_uri (symbolic_uri);
++            return g_file_icon_new (icon_file);
++        }
++        else if (!symbolic &&
++                 (nautilus_file_get_metadata (bookmark->file, NAUTILUS_METADATA_KEY_CUSTOM_ICON, NULL) != NULL ||
++                  nautilus_file_get_metadata (bookmark->file, NAUTILUS_METADATA_KEY_CUSTOM_ICON_NAME, NULL) != NULL))
++        {
++            return nautilus_file_get_gicon (bookmark->file, 0);
++        }
++    }
++
+     GUserDirectory xdg_type;
+ 
+     if (nautilus_bookmark_get_xdg_type (bookmark, &xdg_type))
+@@ -244,6 +265,7 @@
+         g_signal_handlers_disconnect_by_func (bookmark->file,
+                                               G_CALLBACK (bookmark_file_changed_callback),
+                                               bookmark);
++        nautilus_file_monitor_remove (bookmark->file, bookmark);
+         g_clear_object (&bookmark->file);
+     }
+ 
+@@ -286,6 +308,7 @@
+             g_signal_connect_object (bookmark->file, "changed",
+                                      G_CALLBACK (bookmark_file_changed_callback), bookmark,
+                                      G_CONNECT_DEFAULT);
++            nautilus_file_monitor_add (bookmark->file, bookmark, NAUTILUS_ATTRIBUTE_INFO);
+         }
+     }
+ 
+--- a/test/displayless/test-bookmarks.c
++++ b/test/displayless/test-bookmarks.c
+@@ -4,6 +4,8 @@
+ #include <nautilus-bookmark.h>
+ #include <nautilus-file-utilities.h>
+ #include <nautilus-file.h>
++#include <nautilus-file-private.h>
++#include <nautilus-directory-notify.h>
+ 
+ #include <test-utilities.h>
+ 
+@@ -32,6 +34,75 @@
+ 
+     g_assert_nonnull (icon);
+     g_assert_nonnull (symbolic_icon);
++}
++
++static void
++assert_bookmark_icons (NautilusBookmark *bookmark,
++                       GIcon            *expected,
++                       GIcon            *expected_symbolic)
++{
++    g_autoptr (GIcon) icon = nautilus_bookmark_get_icon (bookmark);
++    g_autoptr (GIcon) symbolic = nautilus_bookmark_get_symbolic_icon (bookmark);
++
++    g_assert_true (g_icon_equal (icon, expected));
++    g_assert_true (g_icon_equal (symbolic, expected_symbolic));
++}
++
++static void
++test_bookmark_custom_icon (void)
++{
++    g_autoptr (GFile) location = g_file_new_build_filename (test_get_tmp_dir (),
++                                                            "custom-icon", NULL);
++    g_autoptr (GError) error = NULL;
++    g_autoptr (NautilusFile) file = NULL;
++    g_autoptr (GFileInfo) info = g_file_info_new ();
++    g_autoptr (NautilusBookmark) bookmark = NULL;
++    g_autoptr (GIcon) named_icon = g_themed_icon_new_with_default_fallbacks ("folder-music-symbolic");
++    g_autoptr (GFile) icon_file = g_file_get_child (location, "icon.svg");
++    g_autoptr (GIcon) image_icon = g_file_icon_new (icon_file);
++    g_autoptr (GFile) symbolic_file = g_file_get_child (location, "research-symbolic.svg");
++    g_autofree char *symbolic_uri = g_file_get_uri (symbolic_file);
++    g_autoptr (GIcon) sidebar_icon = g_file_icon_new (symbolic_file);
++    g_autoptr (GIcon) default_symbolic = g_themed_icon_new ("folder-symbolic");
++
++    g_file_make_directory (location, NULL, &error);
++    g_assert_no_error (error);
++    file = nautilus_file_get (location);
++    file_load_attributes (file, NAUTILUS_ATTRIBUTE_INFO);
++
++    /* Metadata may already be cached when a bookmark is constructed. */
++    g_file_info_set_attribute_string (info, "metadata::custom-icon-name", "folder-music-symbolic");
++    g_file_info_set_attribute_string (info, "metadata::custom-symbolic-icon", symbolic_uri);
++    nautilus_file_update_metadata_from_info (file, info);
++    bookmark = nautilus_bookmark_new (location, "Custom icon");
++    assert_bookmark_icons (bookmark, named_icon, sidebar_icon);
++
++    /* A relative image URI takes precedence over the named icon. */
++    g_file_info_set_attribute_string (info, "metadata::custom-icon", "icon.svg");
++    nautilus_file_update_metadata_from_info (file, info);
++    nautilus_file_changed (file);
++    assert_bookmark_icons (bookmark, image_icon, sidebar_icon);
++
++    /* Resetting the sidebar must not remove the full-colour folder icon. */
++    g_file_info_remove_attribute (info, "metadata::custom-symbolic-icon");
++    nautilus_file_update_metadata_from_info (file, info);
++    nautilus_file_changed (file);
++    assert_bookmark_icons (bookmark, image_icon, default_symbolic);
++
++    g_file_info_remove_attribute (info, "metadata::custom-icon");
++    nautilus_file_update_metadata_from_info (file, info);
++    nautilus_file_changed (file);
++    assert_bookmark_icons (bookmark, named_icon, default_symbolic);
++
++    g_file_info_remove_attribute (info, "metadata::custom-icon-name");
++    nautilus_file_update_metadata_from_info (file, info);
++    nautilus_file_changed (file);
++    g_autoptr (GIcon) default_icon = g_themed_icon_new ("folder");
++    assert_bookmark_icons (bookmark, default_icon, default_symbolic);
++
++    g_clear_object (&bookmark);
++    g_file_delete (location, NULL, &error);
++    g_assert_no_error (error);
+ }
+ 
+ static GFile *
+@@ -280,6 +351,8 @@
+ 
+     g_test_add_func ("/bookmarks/basic",
+                      test_bookmark);
++    g_test_add_func ("/bookmarks/custom-icon",
++                     test_bookmark_custom_icon);
+ 
+     g_test_add_func ("/bookmark-list/basic",
+                      test_bookmark_list_basic);
+--- a/src/nautilus-sidebar.c
++++ b/src/nautilus-sidebar.c
+@@ -29,9 +29,11 @@
+ #include "nautilus-dnd.h"
+ #include "nautilus-dbus-launcher.h"
+ #include "nautilus-file.h"
++#include "nautilus-file-chooser.h"
+ #include "nautilus-file-operations.h"
+ #include "nautilus-file-utilities.h"
+ #include "nautilus-global-preferences.h"
++#include "nautilus-metadata.h"
+ #include "nautilus-properties.h"
+ #include "nautilus-scheme.h"
+ #include "nautilus-sidebar-row.h"
+@@ -2159,6 +2161,100 @@
+ }
+ 
+ static void
++bookmark_icon_selected_cb (NautilusFileChooser *dialog,
++                           GList               *locations,
++                           GtkFileFilter       *filter,
++                           gpointer             user_data)
++{
++    NautilusFile *file = g_object_get_data (G_OBJECT (dialog), "bookmark-file");
++    GFile *image = G_FILE (locations->data);
++    g_autofree char *path = g_file_get_path (image);
++    g_autoptr (GError) error = NULL;
++    g_autoptr (GdkPixbuf) preview = NULL;
++
++    if (path == NULL || !g_str_has_suffix (path, "-symbolic.svg"))
++    {
++        g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                             _("Choose a local symbolic SVG icon (a file ending in -symbolic.svg)."));
++    }
++    else
++    {
++        preview = gdk_pixbuf_new_from_file_at_scale (path, 32, 32, TRUE, &error);
++    }
++
++    if (preview == NULL)
++    {
++        nautilus_show_ok_dialog (_("Unable to Set Bookmark Icon"), error->message,
++                                 GTK_WIDGET (dialog));
++        return;
++    }
++
++    g_autofree char *uri = g_file_get_uri (image);
++    nautilus_file_set_metadata (file, NAUTILUS_METADATA_KEY_CUSTOM_SYMBOLIC_ICON, NULL, uri);
++    gtk_window_close (GTK_WINDOW (dialog));
++}
++
++static gboolean
++bookmark_icon_chooser_closed_cb (GtkWindow *window,
++                                 gpointer   user_data)
++{
++    int width, height;
++    gtk_window_get_default_size (window, &width, &height);
++    g_settings_set (nautilus_window_state, NAUTILUS_WINDOW_STATE_INITIAL_SIZE_FILE_CHOOSER,
++                    "(ii)", width, height);
++    return FALSE;
++}
++
++static void
++change_bookmark_icon_cb (GSimpleAction *action,
++                         GVariant      *parameter,
++                         gpointer       user_data)
++{
++    NautilusSidebar *sidebar = user_data;
++    g_autofree char *uri = NULL;
++    NautilusFileChooser *dialog = nautilus_file_chooser_new (NAUTILUS_MODE_OPEN_FILE);
++    g_autoptr (GtkFileFilter) filter = gtk_file_filter_new ();
++    g_autoptr (GListStore) filters = g_list_store_new (GTK_TYPE_FILE_FILTER);
++
++    g_object_get (sidebar->context_row, "uri", &uri, NULL);
++    NautilusFile *file = nautilus_file_get_by_uri (uri);
++    g_object_set_data_full (G_OBJECT (dialog), "bookmark-file", file, g_object_unref);
++    gtk_window_set_title (GTK_WINDOW (dialog), _("Select Bookmark Icon"));
++    nautilus_file_chooser_set_accept_label (dialog, _("_Select"));
++    gtk_file_filter_set_name (filter, _("Symbolic SVG Icons"));
++    gtk_file_filter_add_pattern (filter, "*-symbolic.svg");
++    g_list_store_append (filters, filter);
++    nautilus_file_chooser_set_filters (dialog, G_LIST_MODEL (filters));
++    nautilus_file_chooser_set_current_filter (dialog, 0);
++
++    const char *current = nautilus_file_get_metadata (file, NAUTILUS_METADATA_KEY_CUSTOM_SYMBOLIC_ICON, NULL);
++    g_autoptr (GFile) image = current != NULL ? g_file_new_for_uri (current) : NULL;
++    nautilus_file_chooser_set_starting_location (dialog, image);
++
++    GtkWindow *parent = GTK_WINDOW (gtk_widget_get_root (GTK_WIDGET (sidebar)));
++    gtk_window_set_transient_for (GTK_WINDOW (dialog), parent);
++    gtk_window_set_destroy_with_parent (GTK_WINDOW (dialog), TRUE);
++    gtk_window_set_modal (GTK_WINDOW (dialog), TRUE);
++    gtk_application_add_window (GTK_APPLICATION (g_application_get_default ()), GTK_WINDOW (dialog));
++    g_signal_connect (dialog, "accepted", G_CALLBACK (bookmark_icon_selected_cb), NULL);
++    g_signal_connect (dialog, "close-request", G_CALLBACK (bookmark_icon_chooser_closed_cb), NULL);
++    gtk_window_present (GTK_WINDOW (dialog));
++}
++
++static void
++reset_bookmark_icon_cb (GSimpleAction *action,
++                        GVariant      *parameter,
++                        gpointer       user_data)
++{
++    NautilusSidebar *sidebar = user_data;
++    g_autofree char *uri = NULL;
++    g_object_get (sidebar->context_row, "uri", &uri, NULL);
++    g_autoptr (NautilusFile) file = nautilus_file_get_by_uri (uri);
++
++    nautilus_file_set_metadata (file, NAUTILUS_METADATA_KEY_CUSTOM_SYMBOLIC_ICON, NULL, NULL);
++}
++
++static void
+ properties_cb (GSimpleAction *action,
+                GVariant      *parameter,
+                gpointer       data)
+@@ -2737,6 +2833,8 @@
+     { .name = "open-other", .activate = open_shortcut_cb, .parameter_type = "i"},
+     { .name = "remove", .activate = remove_shortcut_cb},
+     { .name = "rename", .activate = rename_shortcut_cb},
++    { .name = "change-bookmark-icon", .activate = change_bookmark_icon_cb},
++    { .name = "reset-bookmark-icon", .activate = reset_bookmark_icon_cb},
+     { .name = "mount", .activate = mount_shortcut_cb},
+     { .name = "unmount", .activate = unmount_shortcut_cb},
+     { .name = "eject", .activate = eject_shortcut_cb},
+@@ -2909,6 +3007,15 @@
+     g_simple_action_set_enabled (G_SIMPLE_ACTION (action), (type == NAUTILUS_SIDEBAR_ROW_BOOKMARK));
+     action = g_action_map_lookup_action (G_ACTION_MAP (sidebar->row_actions), "rename");
+     g_simple_action_set_enabled (G_SIMPLE_ACTION (action), (type == NAUTILUS_SIDEBAR_ROW_BOOKMARK));
++    gboolean can_change_icon = type == NAUTILUS_SIDEBAR_ROW_BOOKMARK &&
++                               file != NULL && g_file_is_native (file);
++    g_autoptr (NautilusFile) bookmark_file = can_change_icon ? nautilus_file_get (file) : NULL;
++    action = g_action_map_lookup_action (G_ACTION_MAP (sidebar->row_actions), "change-bookmark-icon");
++    g_simple_action_set_enabled (G_SIMPLE_ACTION (action), can_change_icon);
++    action = g_action_map_lookup_action (G_ACTION_MAP (sidebar->row_actions), "reset-bookmark-icon");
++    g_simple_action_set_enabled (G_SIMPLE_ACTION (action),
++                                 can_change_icon &&
++                                 nautilus_file_get_metadata (bookmark_file, NAUTILUS_METADATA_KEY_CUSTOM_SYMBOLIC_ICON, NULL) != NULL);
+     action = g_action_map_lookup_action (G_ACTION_MAP (sidebar->row_actions), "open");
+     g_simple_action_set_enabled (G_SIMPLE_ACTION (action), !gtk_list_box_row_is_selected (GTK_LIST_BOX_ROW (row)));
+     action = g_action_map_lookup_action (G_ACTION_MAP (sidebar->row_actions), "empty-trash");
+@@ -2952,6 +3059,16 @@
+     g_object_unref (item);
+ 
+     item = g_menu_item_new (_("_Rename"), "row.rename");
++    g_menu_item_set_attribute (item, "hidden-when", "s", "action-disabled");
++    g_menu_append_item (section, item);
++    g_object_unref (item);
++
++    item = g_menu_item_new (_("Change Bookmark Icon…"), "row.change-bookmark-icon");
++    g_menu_item_set_attribute (item, "hidden-when", "s", "action-disabled");
++    g_menu_append_item (section, item);
++    g_object_unref (item);
++
++    item = g_menu_item_new (_("Reset Bookmark Icon"), "row.reset-bookmark-icon");
+     g_menu_item_set_attribute (item, "hidden-when", "s", "action-disabled");
+     g_menu_append_item (section, item);
+     g_object_unref (item);
+--- a/src/nautilus-metadata.c
++++ b/src/nautilus-metadata.c
+@@ -32,6 +32,7 @@
+     NAUTILUS_METADATA_KEY_LIST_VIEW_COLUMN_ORDER,
+     NAUTILUS_METADATA_KEY_CUSTOM_ICON,
+     NAUTILUS_METADATA_KEY_CUSTOM_ICON_NAME,
++    NAUTILUS_METADATA_KEY_CUSTOM_SYMBOLIC_ICON,
+     NAUTILUS_METADATA_KEY_EMBLEMS,
+     NULL
+ };
+--- a/src/nautilus-metadata.h
++++ b/src/nautilus-metadata.h
+@@ -43,6 +43,7 @@
+ 
+ #define NAUTILUS_METADATA_KEY_CUSTOM_ICON                	"custom-icon"
+ #define NAUTILUS_METADATA_KEY_CUSTOM_ICON_NAME                	"custom-icon-name"
++#define NAUTILUS_METADATA_KEY_CUSTOM_SYMBOLIC_ICON              "custom-symbolic-icon"
+ #define NAUTILUS_METADATA_KEY_EMBLEMS				"emblems"
+ 
+ guint nautilus_metadata_get_id (const char *metadata);
+--- a/src/nautilus-window-slot.c
++++ b/src/nautilus-window-slot.c
+@@ -1988,6 +1988,8 @@
+     if ((parent_file != NULL) &&
+         nautilus_file_get_file_type (file) == G_FILE_TYPE_REGULAR)
+     {
++        /* pending_file may hold the last reference to the requested file. */
++        g_autoptr (NautilusFile) selected_file = nautilus_file_ref (file);
+         g_clear_pointer (&self->pending_selection, nautilus_file_list_free);
+         g_clear_object (&self->pending_location);
+         self->pending_location = nautilus_file_get_parent_location (file);
+@@ -1999,7 +2001,7 @@
+             self->pending_file_to_activate = nautilus_file_ref (file);
+         }
+ 
+-        self->pending_selection = g_list_prepend (NULL, nautilus_file_ref (file));
++        self->pending_selection = g_list_prepend (NULL, g_steal_pointer (&selected_file));
+ 
+         nautilus_file_invalidate_all_attributes (self->pending_file);
+         nautilus_file_call_when_ready (self->pending_file,
+--- a/test/display/test-window-slot.c
++++ b/test/display/test-window-slot.c
+@@ -2,6 +2,8 @@
+ 
+ #include <nautilus-application.h>
+ #include <nautilus-file-utilities.h>
++#include <nautilus-file.h>
++#include <nautilus-files-view.h>
+ #include <nautilus-query.h>
+ #include <nautilus-query-editor.h>
+ #include <nautilus-resources.h>
+@@ -53,6 +55,43 @@
+                                            0, 0, NULL, NULL, slot), ==, 0);
+ }
+ 
++static void
++open_regular_file_selects_it_in_parent (void)
++{
++    g_autoptr (GError) error = NULL;
++    g_autofree char *path = g_dir_make_tmp ("nautilus-slot-selection-XXXXXX", &error);
++    g_assert_no_error (error);
++    g_autoptr (GFile) parent = g_file_new_for_path (path);
++    g_autoptr (GFile) location = g_file_get_child (parent, "selected.txt");
++    g_file_replace_contents (location, "selection", 9, NULL, FALSE,
++                             G_FILE_CREATE_NONE, NULL, NULL, &error);
++    g_assert_no_error (error);
++
++    g_autoptr (NautilusWindowSlot) slot = nautilus_window_slot_new (NAUTILUS_MODE_OPEN_FILE);
++    GtkWindow *window = GTK_WINDOW (gtk_window_new ());
++    gtk_window_set_child (window, GTK_WIDGET (slot));
++    nautilus_window_slot_set_active (slot, TRUE);
++    gtk_window_present (window);
++    nautilus_window_slot_open_location_full (slot, location, NULL);
++    ITER_CONTEXT_WHILE (nautilus_window_slot_get_current_view (slot) == NULL ||
++                        nautilus_files_view_get_loading (nautilus_window_slot_get_current_view (slot)) ||
++                        nautilus_window_slot_get_selection (slot) == NULL);
++
++    g_assert_true (g_file_equal (nautilus_window_slot_get_location (slot), parent));
++    NautilusFileList *selection = nautilus_window_slot_get_selection (slot);
++    g_assert_cmpuint (g_list_length (selection), ==, 1);
++    g_autoptr (GFile) selected = nautilus_file_get_location (selection->data);
++    g_assert_true (g_file_equal (selected, location));
++
++    nautilus_window_slot_set_active (slot, FALSE);
++    gtk_window_destroy (window);
++    g_clear_object (&slot);
++    g_file_delete (location, NULL, &error);
++    g_assert_no_error (error);
++    g_file_delete (parent, NULL, &error);
++    g_assert_no_error (error);
++}
++
+ int
+ main (int argc, char *argv[])
+ {
+@@ -76,6 +115,7 @@
+ 
+     g_test_add_func ("/slot/query-before-first-view", query_before_first_view);
+     g_test_add_func ("/slot/retained-editor-after-disposal", retained_editor_after_disposal);
++    g_test_add_func ("/slot/open-regular-file-selects-parent", open_regular_file_selects_it_in_parent);
+     int result = g_test_run ();
+ 
+     g_application_release (G_APPLICATION (app));
+--- a/src/nautilus-properties.c
++++ b/src/nautilus-properties.c
+@@ -35,6 +35,7 @@
+ #include "nautilus-dbus-launcher.h"
+ #include "nautilus-enums.h"
+ #include "nautilus-error-reporting.h"
++#include "nautilus-file-chooser.h"
+ #include "nautilus-file-operations.h"
+ #include "nautilus-file-utilities.h"
+ #include "nautilus-global-preferences.h"
+@@ -3961,57 +3962,61 @@
+ }
+ 
+ static void
+-custom_icon_file_chooser_response_cb (GtkFileDialog            *dialog,
+-                                      GAsyncResult             *result,
++custom_icon_file_chooser_response_cb (NautilusFileChooser      *dialog,
++                                      GList                    *locations,
++                                      GtkFileFilter            *filter,
+                                       NautilusPropertiesWidget *self)
+ {
+-    g_autoptr (GError) error = NULL;
+-    g_autoptr (GFile) location = gtk_file_dialog_open_finish (dialog, result, &error);
+-
+-    if (location != NULL)
+-    {
+-        set_icon (self, location);
+-    }
+-    else if (error != NULL &&
+-             !g_error_matches (error, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_DISMISSED))
+-    {
+-        g_warning ("Error while choosing an icon: %s", error->message);
+-    }
++    set_icon (self, G_FILE (locations->data));
++    gtk_window_close (GTK_WINDOW (dialog));
++}
++
++static gboolean
++custom_icon_file_chooser_closed_cb (GtkWindow *window,
++                                    gpointer   user_data)
++{
++    int width, height;
++    gtk_window_get_default_size (window, &width, &height);
++    g_settings_set (nautilus_window_state, NAUTILUS_WINDOW_STATE_INITIAL_SIZE_FILE_CHOOSER,
++                    "(ii)", width, height);
++    return FALSE;
+ }
+ 
+ static void
+ select_image_button_callback (GtkWidget                *widget,
+                               NautilusPropertiesWidget *self)
+ {
+-    g_autoptr (GtkFileDialog) dialog = gtk_file_dialog_new ();
++    NautilusFileChooser *dialog = nautilus_file_chooser_new (NAUTILUS_MODE_OPEN_FILE);
+     g_autoptr (GtkFileFilter) filter = gtk_file_filter_new ();
++    g_autoptr (GListStore) filters = g_list_store_new (GTK_TYPE_FILE_FILTER);
++    g_autoptr (GFile) image_location = NULL;
+     g_auto (GStrv) mime_types = gly_loader_get_mime_types ();
+     NautilusFile *file = get_file (self);
+ 
+-    gtk_file_dialog_set_title (dialog, _("Select Custom Icon"));
+-    gtk_file_dialog_set_accept_label (dialog, _("_Select"));
+-
++    gtk_window_set_title (GTK_WINDOW (dialog), _("Select Custom Icon"));
++    nautilus_file_chooser_set_accept_label (dialog, _("_Select"));
++
++    gtk_file_filter_set_name (filter, _("Images"));
+     gtk_file_filter_add_mime_types (filter, (const char **) mime_types);
+-    gtk_file_dialog_set_default_filter (dialog, filter);
++    g_list_store_append (filters, filter);
++    nautilus_file_chooser_set_filters (dialog, G_LIST_MODEL (filters));
++    nautilus_file_chooser_set_current_filter (dialog, 0);
+ 
+     /* it's likely that the user wants to pick an icon that is inside a local directory */
+     if (nautilus_file_is_directory (file))
+     {
+-        g_autoptr (GFile) image_location = NULL;
+-
+         image_location = nautilus_file_get_location (file);
+-
+-        if (image_location != NULL)
+-        {
+-            gtk_file_dialog_set_initial_folder (dialog, image_location);
+-        }
+-    }
+-
+-    gtk_file_dialog_open (dialog,
+-                          get_parent_window (self),
+-                          NULL,
+-                          (GAsyncReadyCallback) custom_icon_file_chooser_response_cb,
+-                          self);
++    }
++
++    nautilus_file_chooser_set_starting_location (dialog, image_location);
++    gtk_window_set_transient_for (GTK_WINDOW (dialog), get_parent_window (self));
++    gtk_window_set_destroy_with_parent (GTK_WINDOW (dialog), TRUE);
++    gtk_window_set_modal (GTK_WINDOW (dialog), TRUE);
++    gtk_application_add_window (GTK_APPLICATION (g_application_get_default ()), GTK_WINDOW (dialog));
++    g_signal_connect_object (dialog, "accepted", G_CALLBACK (custom_icon_file_chooser_response_cb), self, 0);
++    g_signal_connect_object (self, "unmap", G_CALLBACK (gtk_window_destroy), dialog, G_CONNECT_SWAPPED);
++    g_signal_connect (dialog, "close-request", G_CALLBACK (custom_icon_file_chooser_closed_cb), NULL);
++    gtk_window_present (GTK_WINDOW (dialog));
+ }
+ 
+ static void

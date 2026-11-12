@@ -1,0 +1,265 @@
+From e0b88066e093c08154087f3bf392bd0d656fda92 Mon Sep 17 00:00:00 2001
+From: Dhanraj <dp914278@gmail.com>
+Date: Sat, 31 Oct 2026 13:23:58 +0530
+Subject: [PATCH 01/10] Add configurable Backspace navigation
+
+Restore Backspace shortcut navigation from nautilus <= 3.4 and make the
+navigation action configurable.
+
+Allow users to configure whether pressing Backspace navigates to the
+parent folder (default) or returns to the previous location in history,
+without requiring a restart.
+
+Add preference schema key backspace-action, preferences dialog option
+in the General section, window-slot action routing, and regression tests.
+---
+ NEWS                                          |  5 ++
+ data/org.gnome.nautilus.gschema.xml           | 10 ++++
+ src/nautilus-global-preferences.h             |  7 +++
+ src/nautilus-preferences-dialog.c             | 13 ++++
+ src/nautilus-window-slot.c                    | 16 +++++
+ .../ui/nautilus-preferences-dialog.blp        |  5 ++
+ test/display/test-files-view.c                | 60 +++++++++++++++++++
+ 7 files changed, 116 insertions(+)
+
+diff --git a/NEWS b/NEWS
+index aeded9614..4d4f8f716 100644
+--- a/NEWS
++++ b/NEWS
+@@ -1,3 +1,8 @@
++Downstream changes (nautilus-typeahead)
++=====================================
++- Add a Backspace Action preference: go to the parent folder (default) or
++  return to the previous location in history, without restarting Files.
++
+ Major Changes in 51.1
+ =====================
+ * Bugfixes:
+diff --git a/data/org.gnome.nautilus.gschema.xml b/data/org.gnome.nautilus.gschema.xml
+index 3c14aa4d5..8d0708474 100644
+--- a/data/org.gnome.nautilus.gschema.xml
++++ b/data/org.gnome.nautilus.gschema.xml
+@@ -11,6 +11,11 @@
+     <value value="1" nick="double"/>
+   </enum>
+ 
++  <enum id="org.gnome.nautilus.BackspaceAction">
++    <value value="0" nick="parent-folder"/>
++    <value value="1" nick="history-back"/>
++  </enum>
++
+   <enum id="org.gnome.nautilus.DateTimeFormat">
+     <value value="0" nick="simple"/>
+     <value value="1" nick="detailed"/>
+@@ -82,6 +87,11 @@
+       <summary>Always use the location entry, instead of the pathbar</summary>
+       <description>If set to true, Files will always use a textual input entry for the location toolbar, instead of the pathbar.</description>
+     </key>
++    <key enum="org.gnome.nautilus.BackspaceAction" name="backspace-action">
++      <default>'parent-folder'</default>
++      <summary>Navigation action for the Backspace key</summary>
++      <description>Use “parent-folder” to go up one folder or “history-back” to return to the previous location in history.</description>
++    </key>
+     <key name="recursive-search" enum="org.gnome.nautilus.SpeedTradeoff">
+       <default>'local-only'</default>
+       <summary>Where to perform recursive search</summary>
+diff --git a/src/nautilus-global-preferences.h b/src/nautilus-global-preferences.h
+index ca08bfaa6..1a60b2edd 100644
+--- a/src/nautilus-global-preferences.h
++++ b/src/nautilus-global-preferences.h
+@@ -43,6 +43,13 @@ G_BEGIN_DECLS
+ 
+ /* Spatial or browser mode */
+ #define NAUTILUS_PREFERENCES_NEW_TAB_POSITION			"tabs-open-position"
++#define NAUTILUS_PREFERENCES_BACKSPACE_ACTION                    "backspace-action"
++
++typedef enum
++{
++        NAUTILUS_BACKSPACE_ACTION_PARENT_FOLDER,
++        NAUTILUS_BACKSPACE_ACTION_HISTORY_BACK
++} NautilusBackspaceAction;
+ 
+ #define NAUTILUS_PREFERENCES_ALWAYS_USE_LOCATION_ENTRY		"always-use-location-entry"
+ 
+diff --git a/src/nautilus-preferences-dialog.c b/src/nautilus-preferences-dialog.c
+index 8ff575cbd..e0f5573cb 100644
+--- a/src/nautilus-preferences-dialog.c
++++ b/src/nautilus-preferences-dialog.c
+@@ -54,12 +54,19 @@
+         "thumbnails_row"
+ #define NAUTILUS_PREFERENCES_DIALOG_COUNT_ROW                       \
+         "count_row"
++#define NAUTILUS_PREFERENCES_DIALOG_BACKSPACE_ACTION_ROW                       \
++        "backspace_action_row"
+ 
+ static const char * const speed_tradeoff_values[] =
+ {
+     "local-only", "always", "never",
+     NULL
+ };
++static const char * const backspace_action_values[] =
++{
++    "parent-folder", "history-back", NULL
++};
++
+ 
+ static void
+ bind_builder_bool (GtkBuilder *builder,
+@@ -181,6 +188,8 @@ nautilus_preferences_dialog_setup (GtkBuilder *builder)
+                  (const char *[]) { _("On This Device Only"), _("All Files"), _("Never"), NULL });
+     setup_combo (builder, NAUTILUS_PREFERENCES_DIALOG_COUNT_ROW,
+                  (const char *[]) { _("On This Device Only"), _("All Folders"), _("Never"), NULL });
++    setup_combo (builder, NAUTILUS_PREFERENCES_DIALOG_BACKSPACE_ACTION_ROW,
++                 (const char *[]) { _("Parent Folder"), _("Previous Location"), NULL });
+ 
+     /* setup preferences */
+     bind_builder_bool (builder, gtk_filechooser_preferences,
+@@ -213,6 +222,10 @@ nautilus_preferences_dialog_setup (GtkBuilder *builder)
+                             NAUTILUS_PREFERENCES_DIALOG_COUNT_ROW,
+                             NAUTILUS_PREFERENCES_SHOW_DIRECTORY_ITEM_COUNTS,
+                             (const char **) speed_tradeoff_values);
++    bind_builder_combo_row (builder, nautilus_preferences,
++                            NAUTILUS_PREFERENCES_DIALOG_BACKSPACE_ACTION_ROW,
++                            NAUTILUS_PREFERENCES_BACKSPACE_ACTION,
++                            (const char **) backspace_action_values);
+ }
+ 
+ void
+diff --git a/src/nautilus-window-slot.c b/src/nautilus-window-slot.c
+index e22fb83da..b03086dc2 100644
+--- a/src/nautilus-window-slot.c
++++ b/src/nautilus-window-slot.c
+@@ -973,6 +973,20 @@ action_up (GSimpleAction *action,
+     nautilus_window_slot_go_up (self);
+ }
+ 
++static void
++action_backspace (GSimpleAction *action,
++                  GVariant      *parameter,
++                  gpointer       user_data)
++{
++    NautilusWindowSlot *self = NAUTILUS_WINDOW_SLOT (user_data);
++    gboolean history_back = g_settings_get_enum (nautilus_preferences,
++                                                 NAUTILUS_PREFERENCES_BACKSPACE_ACTION) ==
++                            NAUTILUS_BACKSPACE_ACTION_HISTORY_BACK;
++
++    g_action_group_activate_action (G_ACTION_GROUP (self->slot_action_group),
++                                    history_back ? "back" : "up", NULL);
++}
++
+ static void
+ action_down (GSimpleAction *action,
+              GVariant      *state,
+@@ -1221,6 +1235,7 @@ const GActionEntry slot_entries[] =
+     { .name = "back-n", .activate = action_navigate_n, .parameter_type = "i" },
+     { .name = "forward-n", .activate = action_navigate_n, .parameter_type = "i" },
+     { .name = "up", .activate = action_up },
++    { .name = "backspace", .activate = action_backspace },
+     { .name = "down", .activate = action_down },
+     {
+         .name = "files-view-mode", .parameter_type = "u",
+@@ -1352,6 +1367,7 @@ nautilus_window_slot_init (NautilusWindowSlot *self)
+     ADD_SHORTCUT_FOR_ACTION (self->shortcuts, "slot.reload", "F5|<ctrl>r|Refresh|Reload");
+     ADD_SHORTCUT_FOR_ACTION (self->shortcuts, "slot.stop", "Stop");
+     ADD_SHORTCUT_FOR_ACTION (self->shortcuts, "slot.up", "<alt>Up");
++    ADD_SHORTCUT_FOR_ACTION (self->shortcuts, "slot.backspace", "BackSpace");
+     ADD_SHORTCUT_FOR_ACTION (self->shortcuts, "slot.down", "<alt>Down");
+     ADD_SHORTCUT_FOR_ACTION (self->shortcuts, "slot.bookmark-current-directory", "<control>d|AddFavorite");
+ 
+diff --git a/src/resources/ui/nautilus-preferences-dialog.blp b/src/resources/ui/nautilus-preferences-dialog.blp
+index fa03d206a..082908dd5 100644
+--- a/src/resources/ui/nautilus-preferences-dialog.blp
++++ b/src/resources/ui/nautilus-preferences-dialog.blp
+@@ -39,6 +39,11 @@ Adw.PreferencesDialog preferences_dialog {
+           }
+         }
+       }
++
++      Adw.ComboRow backspace_action_row {
++        title: _("_Backspace Action");
++        use-underline: true;
++      }
+     }
+ 
+     Adw.PreferencesGroup {
+diff --git a/test/display/test-files-view.c b/test/display/test-files-view.c
+index 003d2d588..6e7643b36 100644
+--- a/test/display/test-files-view.c
++++ b/test/display/test-files-view.c
+@@ -1265,6 +1265,65 @@ test_load_dir (void)
+     test_clear_tmp_dir ();
+ }
+ 
++static void
++assert_slot_location (NautilusWindowSlot *slot,
++                      GFile              *expected)
++{
++    ITER_CONTEXT_WHILE (nautilus_window_slot_get_allow_stop (slot));
++    g_assert_true (g_file_equal (nautilus_window_slot_get_location (slot), expected));
++}
++
++static void
++test_backspace_navigation (void)
++{
++    int saved_action = g_settings_get_enum (nautilus_preferences, NAUTILUS_PREFERENCES_BACKSPACE_ACTION);
++    g_autoptr (NautilusWindowSlot) slot = nautilus_window_slot_new (NAUTILUS_MODE_BROWSE);
++    g_autoptr (GFile) parent = g_file_new_for_path (test_get_tmp_dir ());
++    g_autoptr (GFile) first = g_file_get_child (parent, "first");
++    g_autoptr (GFile) second = g_file_get_child (parent, "second");
++    g_autoptr (GFile) root = g_file_new_for_path ("/");
++    g_autoptr (GError) error = NULL;
++
++    g_file_make_directory (first, NULL, &error);
++    g_assert_no_error (error);
++    g_file_make_directory (second, NULL, &error);
++    g_assert_no_error (error);
++    nautilus_window_slot_open_location_full (slot, first, NULL);
++    assert_slot_location (slot, first);
++
++    /* No history must not fall back to the parent. */
++    g_settings_set_enum (nautilus_preferences, NAUTILUS_PREFERENCES_BACKSPACE_ACTION,
++                         NAUTILUS_BACKSPACE_ACTION_HISTORY_BACK);
++    gtk_widget_activate_action (GTK_WIDGET (slot), "slot.backspace", NULL);
++    assert_slot_location (slot, first);
++
++    nautilus_window_slot_open_location_full (slot, second, NULL);
++    assert_slot_location (slot, second);
++    g_settings_set_enum (nautilus_preferences, NAUTILUS_PREFERENCES_BACKSPACE_ACTION,
++                         NAUTILUS_BACKSPACE_ACTION_PARENT_FOLDER);
++    gtk_widget_activate_action (GTK_WIDGET (slot), "slot.backspace", NULL);
++    assert_slot_location (slot, parent);
++
++    /* Existing slots pick up the preference immediately. */
++    g_settings_set_enum (nautilus_preferences, NAUTILUS_PREFERENCES_BACKSPACE_ACTION,
++                         NAUTILUS_BACKSPACE_ACTION_HISTORY_BACK);
++    gtk_widget_activate_action (GTK_WIDGET (slot), "slot.backspace", NULL);
++    assert_slot_location (slot, second);
++    gtk_widget_activate_action (GTK_WIDGET (slot), "slot.backspace", NULL);
++    assert_slot_location (slot, first);
++
++    nautilus_window_slot_open_location_full (slot, root, NULL);
++    assert_slot_location (slot, root);
++    g_settings_set_enum (nautilus_preferences, NAUTILUS_PREFERENCES_BACKSPACE_ACTION,
++                         NAUTILUS_BACKSPACE_ACTION_PARENT_FOLDER);
++    gtk_widget_activate_action (GTK_WIDGET (slot), "slot.backspace", NULL);
++    assert_slot_location (slot, root);
++
++    g_settings_set_enum (nautilus_preferences, NAUTILUS_PREFERENCES_BACKSPACE_ACTION, saved_action);
++    g_clear_object (&slot);
++    test_clear_tmp_dir ();
++}
++
+ int
+ main (int   argc,
+       char *argv[])
+@@ -1314,6 +1373,7 @@ main (int   argc,
+                      test_open_item_location_in_search);
+     g_test_add_func ("/view/actions/zoom",
+                      test_zoom_actions);
++    g_test_add_func ("/view/navigation/backspace", test_backspace_navigation);
+ 
+     return g_test_run ();
+ }
+-- 
+2.56.0
+

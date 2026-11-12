@@ -1,6 +1,5 @@
 post_install() {
-	echo "If you want typeahead search back in Nautilus, please upvote the issue here: https://gitlab.gnome.org/Teams/Design/whiteboards/-/issues/142"
-	echo "Thanks :)"
+	echo "Nautilus Extended: restart Nautilus when file operations are complete."
 }
 
 post_upgrade() {

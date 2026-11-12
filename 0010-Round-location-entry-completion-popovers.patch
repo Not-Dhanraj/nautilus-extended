@@ -1,0 +1,54 @@
+From 4f419d86773f053d16dd544e41f65f8bfcc37012 Mon Sep 17 00:00:00 2001
+From: Dhanraj <dp914278@gmail.com>
+Date: Sat, 31 Oct 2026 13:38:21 +0530
+Subject: [PATCH] location-entry: Round completion popover contents and row
+ highlights
+
+Add the entry scope class and restrict the radius/padding rules to its
+completion popup. Target GtkTreeView's actual transient cell context for
+row rounding rather than an unused row-widget selector. Keep completion
+acceptance, navigation, colors and unrelated popovers unchanged.
+---
+ src/nautilus-location-entry.c |  1 +
+ src/resources/style.css       | 16 ++++++++++++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/src/nautilus-location-entry.c b/src/nautilus-location-entry.c
+index 51ad9e979..66717d4b9 100644
+--- a/src/nautilus-location-entry.c
++++ b/src/nautilus-location-entry.c
+@@ -860,6 +860,7 @@ nautilus_location_entry_init (NautilusLocationEntry *entry)
+     GtkEventController *controller;
+ 
+     priv = nautilus_location_entry_get_instance_private (entry);
++    gtk_widget_add_css_class (GTK_WIDGET (entry), "nautilus-location-entry");
+ 
+     gtk_entry_set_input_purpose (GTK_ENTRY (entry), GTK_INPUT_PURPOSE_URL);
+     gtk_entry_set_input_hints (GTK_ENTRY (entry), GTK_INPUT_HINT_NO_SPELLCHECK | GTK_INPUT_HINT_NO_EMOJI);
+diff --git a/src/resources/style.css b/src/resources/style.css
+index c490a7fc6..80378247b 100644
+--- a/src/resources/style.css
++++ b/src/resources/style.css
+@@ -92,6 +92,22 @@
+   opacity: 1;
+ }
+ 
++/* Location entry completion popover styling */
++.nautilus-location-entry popover.entry-completion.background,
++.nautilus-location-entry popover.entry-completion contents {
++  border-radius: 12px;
++  padding: 4px;
++}
++
++.nautilus-location-entry popover.entry-completion treeview {
++  border-radius: 8px;
++}
++
++/* GtkTreeView paints rows using a transient .cell style context. */
++.nautilus-location-entry popover.entry-completion treeview.cell {
++  border-radius: 6px;
++}
++
+ /* Search bar */
+ 
+ .nautilus-query-editor > menubutton > button {

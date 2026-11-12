@@ -1,0 +1,448 @@
+From bd664ce01c685c4e32ac86276eac9dcf179e602a Mon Sep 17 00:00:00 2001
+From: Dhanraj <dp914278@gmail.com>
+Date: Fri, 30 Oct 2026 23:34:04 +0530
+Subject: [PATCH 07/10] application: Add external-open window preference
+
+Allow externally requested locations to open in fresh windows without
+changing internal tab navigation. Preserve explicit new-window precedence
+and existing reuse behavior when the preference is disabled. Include the
+preference UI, schema, and routing regression independently of view styling.
+---
+ NEWS                                          |   2 +
+ data/org.gnome.nautilus.gschema.xml           |   7 +-
+ src/nautilus-application.c                    |  35 +++-
+ src/nautilus-global-preferences.h             |   1 +
+ src/nautilus-preferences-dialog.c             |   7 +-
+ .../ui/nautilus-preferences-dialog.blp        |   5 +
+ test/display/meson.build                      |   3 +
+ test/display/test-application.c               | 221 ++++++++++++++++++
+ 8 files changed, 272 insertions(+), 9 deletions(-)
+ create mode 100644 test/display/test-application.c
+
+diff --git a/NEWS b/NEWS
+index cafa3f7eb..9587c101b 100644
+--- a/NEWS
++++ b/NEWS
+@@ -4,6 +4,8 @@ Downstream changes (nautilus-typeahead)
+   return to the previous location in history, without restarting Files.
+ - Use native GTK selection nodes and theme states for grouped icon highlights
+   and rubberband rectangles, including neutral view accents and contrast rules.
++- Add an opt-in preference to open externally requested locations in new
++  windows, including FileManager1, GApplication, and command-line requests.
+ - Add per-folder time and name grouping in both icon and list views, including
+   Nautilus's own Open File/Open Folder chooser. View Options offers No Grouping,
+   Group by Time, and Group by Name (A–Z). Downloads defaults to time grouping.
+diff --git a/data/org.gnome.nautilus.gschema.xml b/data/org.gnome.nautilus.gschema.xml
+index a78fd8bec..825026f80 100644
+--- a/data/org.gnome.nautilus.gschema.xml
++++ b/data/org.gnome.nautilus.gschema.xml
+@@ -92,7 +92,12 @@
+       <summary>Start searching on type ahead</summary>
+       <description>If set to true, typing on the files viewer will start searching. Otherwise it select first matching file.</description>
+     </key>
+-    <key enum="org.gnome.nautilus.BackspaceAction" name="backspace-action">
++    <key type="b" name="open-external-in-new-window">
++      <default>false</default>
++      <summary>Always open external locations in a new window</summary>
++      <description>If set to true, locations opened from outside Files or from the command line will always open in a new window instead of reusing an existing window.</description>
++    </key>
++    <key name="backspace-action" enum="org.gnome.nautilus.BackspaceAction">
+       <default>'parent-folder'</default>
+       <summary>Navigation action for the Backspace key</summary>
+       <description>Use “parent-folder” to go up one folder or “history-back” to return to the previous location in history.</description>
+diff --git a/src/nautilus-application.c b/src/nautilus-application.c
+index 275c3fd67..a89080d93 100644
+--- a/src/nautilus-application.c
++++ b/src/nautilus-application.c
+@@ -429,7 +429,15 @@ nautilus_application_open_location (NautilusApplication *self,
+         sel_list = g_list_prepend (sel_list, nautilus_file_get (selection));
+     }
+ 
+-    nautilus_application_open_location_full (self, location, NAUTILUS_OPEN_FLAG_REUSE_EXISTING,
++    NautilusOpenFlags flags = NAUTILUS_OPEN_FLAG_REUSE_EXISTING;
++
++    if (g_settings_get_boolean (nautilus_preferences,
++                                NAUTILUS_PREFERENCES_OPEN_EXTERNAL_IN_NEW_WINDOW))
++    {
++        flags = NAUTILUS_OPEN_FLAG_NEW_WINDOW;
++    }
++
++    nautilus_application_open_location_full (self, location, flags,
+                                              sel_list, startup_id);
+ }
+ 
+@@ -448,7 +456,10 @@ nautilus_application_open (GApplication  *app,
+     NautilusApplication *self = NAUTILUS_APPLICATION (app);
+ 
+     /* Either open new window or re-open existing location to update selection */
+-    NautilusOpenFlags flags = g_strcmp0 (hint, "new-window") == 0
++    gboolean open_in_new_window = g_strcmp0 (hint, "new-window") == 0 ||
++                                  g_settings_get_boolean (nautilus_preferences,
++                                                          NAUTILUS_PREFERENCES_OPEN_EXTERNAL_IN_NEW_WINDOW);
++    NautilusOpenFlags flags = open_in_new_window
+                               ? NAUTILUS_OPEN_FLAG_NEW_WINDOW
+                               : NAUTILUS_OPEN_FLAG_REUSE_EXISTING;
+ 
+@@ -528,11 +539,18 @@ do_cmdline_sanity_checks (GVariantDict *options)
+ static void
+ nautilus_application_select (NautilusApplication  *self,
+                              GFile               **files,
+-                             gint                  len)
++                             gint                  len,
++                             gboolean              new_window)
+ {
+     int i;
+     GFile *file;
+     GFile *parent;
++    gboolean open_in_new_window = new_window ||
++                                  g_settings_get_boolean (nautilus_preferences,
++                                                          NAUTILUS_PREFERENCES_OPEN_EXTERNAL_IN_NEW_WINDOW);
++    NautilusOpenFlags flags = open_in_new_window
++                              ? NAUTILUS_OPEN_FLAG_NEW_WINDOW
++                              : NAUTILUS_OPEN_FLAG_REUSE_EXISTING;
+ 
+     for (i = 0; i < len; i++)
+     {
+@@ -540,12 +558,13 @@ nautilus_application_select (NautilusApplication  *self,
+         parent = g_file_get_parent (file);
+         if (parent != NULL)
+         {
+-            nautilus_application_open_location (self, parent, file, NULL);
++            g_autolist (NautilusFile) sel_list = g_list_prepend (NULL, nautilus_file_get (file));
++            nautilus_application_open_location_full (self, parent, flags, sel_list, NULL);
+             g_object_unref (parent);
+         }
+         else
+         {
+-            nautilus_application_open_location (self, file, NULL, NULL);
++            nautilus_application_open_location_full (self, file, flags, NULL, NULL);
+         }
+     }
+ }
+@@ -793,15 +812,17 @@ nautilus_application_handle_file_args (NautilusApplication *self,
+     len = file_array->len;
+     files = (GFile **) file_array->pdata;
+ 
++    gboolean new_window = g_variant_dict_contains (options, "new-window");
++
+     if (g_variant_dict_contains (options, "select"))
+     {
+-        nautilus_application_select (self, files, len);
++        nautilus_application_select (self, files, len, new_window);
+     }
+     else
+     {
+         /* Create new windows */
+         nautilus_application_open (G_APPLICATION (self), files, len,
+-                                   g_variant_dict_contains (options, "new-window") ? "new-window" : "");
++                                   new_window ? "new-window" : "");
+     }
+ 
+     g_ptr_array_unref (file_array);
+diff --git a/src/nautilus-global-preferences.h b/src/nautilus-global-preferences.h
+index 8cf294d85..149249288 100644
+--- a/src/nautilus-global-preferences.h
++++ b/src/nautilus-global-preferences.h
+@@ -43,6 +43,7 @@ G_BEGIN_DECLS
+ 
+ /* Spatial or browser mode */
+ #define NAUTILUS_PREFERENCES_NEW_TAB_POSITION			"tabs-open-position"
++#define NAUTILUS_PREFERENCES_OPEN_EXTERNAL_IN_NEW_WINDOW	"open-external-in-new-window"
+ #define NAUTILUS_PREFERENCES_BACKSPACE_ACTION                    "backspace-action"
+ 
+ typedef enum
+diff --git a/src/nautilus-preferences-dialog.c b/src/nautilus-preferences-dialog.c
+index 9ab648286..74840dcfc 100644
+--- a/src/nautilus-preferences-dialog.c
++++ b/src/nautilus-preferences-dialog.c
+@@ -44,6 +44,8 @@
+         "use_tree_view_row"
+ #define NAUTILUS_PREFERENCES_DIALOG_TYPE_AHEAD_WIDGET                          \
+         "type_ahead_search"
++#define NAUTILUS_PREFERENCES_DIALOG_OPEN_EXTERNAL_IN_NEW_WINDOW_WIDGET         \
++        "open_external_in_new_window_row"
+ 
+ /* toggle group preferences */
+ #define NAUTILUS_PREFERENCES_DIALOG_OPEN_ACTION_TOGGLE_GROUP                   \
+@@ -64,12 +66,12 @@ static const char * const speed_tradeoff_values[] =
+     "local-only", "always", "never",
+     NULL
+ };
++
+ static const char * const backspace_action_values[] =
+ {
+     "parent-folder", "history-back", NULL
+ };
+ 
+-
+ static void
+ bind_builder_bool (GtkBuilder *builder,
+                    GSettings  *settings,
+@@ -209,6 +211,9 @@ nautilus_preferences_dialog_setup (GtkBuilder *builder)
+     bind_builder_bool (builder, nautilus_preferences,
+                        NAUTILUS_PREFERENCES_DIALOG_TYPE_AHEAD_WIDGET,
+                        NAUTILUS_PREFERENCES_TYPE_AHEAD_SEARCH);
++    bind_builder_bool (builder, nautilus_preferences,
++                       NAUTILUS_PREFERENCES_DIALOG_OPEN_EXTERNAL_IN_NEW_WINDOW_WIDGET,
++                       NAUTILUS_PREFERENCES_OPEN_EXTERNAL_IN_NEW_WINDOW);
+ 
+     setup_detailed_date (builder);
+ 
+diff --git a/src/resources/ui/nautilus-preferences-dialog.blp b/src/resources/ui/nautilus-preferences-dialog.blp
+index 1840c258e..561e7f3a0 100644
+--- a/src/resources/ui/nautilus-preferences-dialog.blp
++++ b/src/resources/ui/nautilus-preferences-dialog.blp
+@@ -52,6 +52,11 @@ Adw.PreferencesDialog preferences_dialog {
+         activatable-widget: type_ahead_search;
+       }
+ 
++      Adw.SwitchRow open_external_in_new_window_row {
++        title: _("Open External Locations in a _New Window");
++        use-underline: true;
++      }
++
+       Adw.ComboRow backspace_action_row {
+         title: _("_Backspace Action");
+         use-underline: true;
+diff --git a/test/display/meson.build b/test/display/meson.build
+index 0e8d8f4ed..596a67f63 100644
+--- a/test/display/meson.build
++++ b/test/display/meson.build
+@@ -1,4 +1,7 @@
+ tests = {
++  'test-application': {
++    'is_parallel': false,
++  },
+   'test-nautilus-directory-async': {},
+   'test-file-operations-create': {},
+   'test-window-slot': {
+diff --git a/test/display/test-application.c b/test/display/test-application.c
+new file mode 100644
+index 000000000..2743b38af
+--- /dev/null
++++ b/test/display/test-application.c
+@@ -0,0 +1,221 @@
++/*
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ *
++ * Test suite for NautilusApplication external window routing
++ */
++
++#define G_LOG_DOMAIN "test-application"
++
++#include <nautilus-application.h>
++#include <nautilus-file.h>
++#include <nautilus-file-utilities.h>
++#include <nautilus-global-preferences.h>
++#include <nautilus-mime-actions.h>
++#include <nautilus-resources.h>
++#include <nautilus-tag-manager.h>
++#include <nautilus-window.h>
++
++#include <test-utilities.h>
++
++#include <glib.h>
++#include <glib/gstdio.h>
++#include <gtk/gtk.h>
++
++static void
++file_ready (NautilusFile *file,
++            gpointer      user_data)
++{
++    *(gboolean *) user_data = TRUE;
++}
++
++static void
++test_open_external_in_new_window (void)
++{
++    g_autoptr (NautilusTagManager) tag_manager = nautilus_tag_manager_new_dummy ();
++
++    test_init_config_dir ();
++
++    g_autoptr (NautilusApplication) app = nautilus_application_new ();
++    g_autoptr (GFile) dir1 = g_file_new_for_path (g_get_home_dir ());
++    g_autoptr (GFile) dir2 = g_file_new_for_path (g_get_tmp_dir ());
++    g_autoptr (GFile) dir3 = g_file_new_for_path (g_get_user_cache_dir ());
++    g_autoptr (GFile) dir4 = g_file_new_for_path (g_get_user_config_dir ());
++    GFile *files1[] = { dir1 };
++    GFile *files2[] = { dir2 };
++    GList *windows = NULL;
++    g_autofree char *archive_dir = g_build_filename (g_get_user_cache_dir (), "archive-test", NULL);
++    g_autofree char *archive_path = g_build_filename (archive_dir, "archive.zip", NULL);
++    g_autofree char *payload_path = g_build_filename (archive_dir, "archive", "payload.txt", NULL);
++    g_autofree char *extracted_dir = g_build_filename (archive_dir, "archive", NULL);
++    g_autoptr (GFile) archive = g_file_new_for_path (archive_path);
++    g_autoptr (GFile) archive_parent = g_file_new_for_path (archive_dir);
++    g_autoptr (NautilusFile) cached_archive = NULL;
++    g_autoptr (GError) error = NULL;
++    gsize archive_size;
++    g_autofree guchar *archive_bytes = g_base64_decode (
++        "UEsDBBQAAAAAAFKYbF1faUheEwAAABMAAAALAAAAcGF5bG9hZC50eHRhcmNoaXZlIHJlZ3Jlc3Npb24KUEsBAhQDFAAAAAAAUphsXV9pSF4TAAAAEwAAAAsAAAAAAAAAAAAAAIABAAAAAHBheWxvYWQudHh0UEsFBgAAAAABAAEAOQAAADwAAAAAAA==",
++        &archive_size);
++    gboolean ready = FALSE;
++    gint64 deadline;
++    NautilusWindow *initial_window = NULL;
++
++    g_application_set_application_id (G_APPLICATION (app), "org.gnome.Nautilus.TestApplication");
++    g_application_hold (G_APPLICATION (app));
++    g_assert_true (g_application_register (G_APPLICATION (app), NULL, NULL));
++    g_application_open (G_APPLICATION (app), files1, 1, "");
++
++    windows = nautilus_application_get_windows (app);
++    g_assert_cmpint (g_list_length (windows), ==, 1);
++    initial_window = NAUTILUS_WINDOW (windows->data);
++
++    /* 1. Default toggle is false: GApplication open and external open_location reuse existing window */
++    g_settings_set_boolean (nautilus_preferences,
++                            NAUTILUS_PREFERENCES_OPEN_EXTERNAL_IN_NEW_WINDOW,
++                            FALSE);
++
++    g_application_open (G_APPLICATION (app), files1, 1, "");
++    windows = nautilus_application_get_windows (app);
++    g_assert_cmpint (g_list_length (windows), ==, 1);
++    g_assert_true (windows->data == initial_window);
++
++    nautilus_application_open_location (app, dir2, NULL, NULL);
++    windows = nautilus_application_get_windows (app);
++    g_assert_cmpint (g_list_length (windows), ==, 1);
++    g_assert_true (windows->data == initial_window);
++
++    /* 2. Explicit new-window hint honored regardless of toggle */
++    g_application_open (G_APPLICATION (app), files1, 1, "new-window");
++    windows = nautilus_application_get_windows (app);
++    g_assert_cmpint (g_list_length (windows), ==, 2);
++
++    /* 3. Toggle true: external GApplication open and helper open_location open fresh windows */
++    g_settings_set_boolean (nautilus_preferences,
++                            NAUTILUS_PREFERENCES_OPEN_EXTERNAL_IN_NEW_WINDOW,
++                            TRUE);
++
++    g_application_open (G_APPLICATION (app), files2, 1, "");
++    windows = nautilus_application_get_windows (app);
++    g_assert_cmpint (g_list_length (windows), ==, 3);
++
++    nautilus_application_open_location (app, dir3, NULL, NULL);
++    windows = nautilus_application_get_windows (app);
++    g_assert_cmpint (g_list_length (windows), ==, 4);
++
++    /* 4. Internal navigation / NEW_TAB remains unaffected by the toggle */
++    nautilus_application_open_location_full (app, dir4,
++                                             NAUTILUS_OPEN_FLAG_NEW_TAB,
++                                             NULL, NULL);
++    windows = nautilus_application_get_windows (app);
++    g_assert_cmpint (g_list_length (windows), ==, 4);
++
++    /* A cached archive must still be activated when opened in a new window. */
++    g_assert_cmpint (g_mkdir (archive_dir, 0700), ==, 0);
++    g_assert_true (g_file_set_contents (archive_path, (const char *) archive_bytes,
++                                        archive_size, &error));
++    g_assert_no_error (error);
++    cached_archive = nautilus_file_get (archive);
++    nautilus_file_call_when_ready (cached_archive, NAUTILUS_ATTRIBUTE_INFO, file_ready, &ready);
++    deadline = g_get_monotonic_time () + 10 * G_TIME_SPAN_SECOND;
++    while (!ready && g_get_monotonic_time () < deadline)
++    {
++        g_main_context_iteration (NULL, FALSE);
++        g_usleep (1000);
++    }
++    g_assert_true (ready);
++    g_assert_true (nautilus_mime_file_extracts (cached_archive));
++
++    GFile *archive_files[] = { archive };
++    for (guint i = 0; i < 2; i++)
++    {
++        GList *old_windows = g_list_copy (nautilus_application_get_windows (app));
++        NautilusWindow *archive_window = NULL;
++        g_autofree char *payload = NULL;
++
++        if (i == 1)
++        {
++            g_assert_cmpint (g_remove (payload_path), ==, 0);
++            g_assert_cmpint (g_rmdir (extracted_dir), ==, 0);
++            g_settings_set_boolean (nautilus_preferences,
++                                    NAUTILUS_PREFERENCES_OPEN_EXTERNAL_IN_NEW_WINDOW,
++                                    FALSE);
++        }
++        g_application_open (G_APPLICATION (app), archive_files, 1, i == 0 ? "" : "new-window");
++        windows = nautilus_application_get_windows (app);
++        g_assert_cmpint (g_list_length (windows), ==, 5 + i);
++        for (GList *l = windows; l != NULL; l = l->next)
++        {
++            if (g_list_find (old_windows, l->data) == NULL)
++            {
++                archive_window = NAUTILUS_WINDOW (l->data);
++                break;
++            }
++        }
++        g_list_free (old_windows);
++        g_assert_nonnull (archive_window);
++        deadline = g_get_monotonic_time () + 10 * G_TIME_SPAN_SECOND;
++        while (g_get_monotonic_time () < deadline)
++        {
++            g_clear_pointer (&payload, g_free);
++            if (g_file_get_contents (payload_path, &payload, NULL, NULL) &&
++                g_strcmp0 (payload, "archive regression\n") == 0 &&
++                nautilus_window_has_open_location (archive_window, archive_parent))
++            {
++                break;
++            }
++            g_main_context_iteration (NULL, FALSE);
++            g_usleep (1000);
++        }
++        g_assert_true (nautilus_window_has_open_location (archive_window, archive_parent));
++        g_assert_cmpstr (payload, ==, "archive regression\n");
++    }
++
++    /* Reset preference */
++    g_settings_set_boolean (nautilus_preferences,
++                            NAUTILUS_PREFERENCES_OPEN_EXTERNAL_IN_NEW_WINDOW,
++                            FALSE);
++
++    while (nautilus_application_get_windows (app) != NULL)
++    {
++        gtk_window_destroy (GTK_WINDOW (nautilus_application_get_windows (app)->data));
++    }
++    g_application_release (G_APPLICATION (app));
++    g_application_quit (G_APPLICATION (app));
++}
++
++int
++main (int   argc,
++      char *argv[])
++{
++    g_autoptr (GError) error = NULL;
++    g_autofree char *config_dir = g_dir_make_tmp ("nautilus-application-XXXXXX", &error);
++    g_assert_no_error (error);
++    g_setenv ("XDG_CONFIG_HOME", config_dir, TRUE);
++    g_setenv ("XDG_CONFIG_DIRS", config_dir, TRUE);
++    g_setenv ("XDG_CURRENT_DESKTOP", "NautilusTest", TRUE);
++    g_setenv ("XDG_DATA_HOME", config_dir, TRUE);
++    g_setenv ("XDG_CACHE_HOME", config_dir, TRUE);
++    g_autofree char *applications_dir = g_build_filename (config_dir, "applications", NULL);
++    g_autofree char *desktop_path = g_build_filename (applications_dir, NAUTILUS_DESKTOP_ID, NULL);
++    g_autofree char *mime_path = g_build_filename (config_dir, "mimeapps.list", NULL);
++    g_autofree char *mime_contents = g_strdup_printf ("[Default Applications]\napplication/zip=%s;\n", NAUTILUS_DESKTOP_ID);
++    g_assert_cmpint (g_mkdir_with_parents (applications_dir, 0700), ==, 0);
++    g_assert_true (g_file_set_contents (desktop_path,
++                                        "[Desktop Entry]\nType=Application\nName=Files\nExec=true %U\nMimeType=application/zip;\n",
++                                        -1, &error));
++    g_assert_no_error (error);
++    g_assert_true (g_file_set_contents (mime_path, mime_contents, -1, &error));
++    g_assert_no_error (error);
++    g_test_init (&argc, &argv, NULL);
++
++    nautilus_register_resource ();
++    nautilus_ensure_extension_points ();
++
++    g_test_add_func ("/application/open-external-in-new-window",
++                     test_open_external_in_new_window);
++
++    int result = g_test_run ();
++    g_autoptr (GFile) config = g_file_new_for_path (config_dir);
++    empty_directory_by_prefix (config, "");
++    g_rmdir (config_dir);
++    return result;
++}
+-- 
+2.56.0
+
