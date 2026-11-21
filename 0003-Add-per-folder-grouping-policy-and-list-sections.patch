@@ -1604,7 +1604,7 @@ diff --git a/src/resources/style.css b/src/resources/style.css
 index 4e8aed9c4..1973cdefc 100644
 --- a/src/resources/style.css
 +++ b/src/resources/style.css
-@@ -171,6 +171,51 @@
+@@ -171,6 +171,57 @@
    border-radius: 12px;
  }
  
@@ -1638,8 +1638,14 @@ index 4e8aed9c4..1973cdefc 100644
 +}
 +
 +.nautilus-grid-view .grouped-section-header {
++  margin-top: 4px;
++  margin-bottom: 6px;
 +  margin-left: 24px;
 +  margin-right: 24px;
++}
++
++.nautilus-grid-view .grouped-section-header.first-section {
++  margin-top: 8px;
 +}
 +
 +.nautilus-list-view .grouped-section-header {
